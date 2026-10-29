@@ -2705,6 +2705,18 @@ const DEMO_DATA = [
 // typed as a number, or a date column comes back as a native Date object
 // after JSON serialization) — every downstream .trim()/.includes() call
 // assumes a string, so this boundary is the one place that must never throw.
+// ---- أمان: ترميز/تعقيم ----
+// 1) الحقول النصية القصيرة (أسماء/فئات) تُعقَّم عند الدخول في buildData: < > " ' تُستبدل بمشابهاتها.
+// 2) النصوص الحرة (FREE_TEXT_FIELDS) تُحفظ كما هي وتُرمَّز عند عرضها بـ escH.
+const FREE_TEXT_FIELDS = new Set(['content','notes','investigation_result']);
+const SAFEC = {'<':'\u2039','>':'\u203a','"':'\u2033',"'":'\u2019'};
+function safeTxt(v){ return String(v).replace(/[<>"']/g, c=>SAFEC[c]); }
+// تصدير CSV: خلية نصية تبدأ بـ = + - @ Tab CR تُسبق بـ ' (Formula Injection)؛ الأرقام الحقيقية لا تُمس
+function csvCell(v){ let t = String(v??''); if(typeof v === 'string' && /^[=+\-@\t\r]/.test(t)) t = "'" + t; return `"${t.replace(/"/g,'""')}"`; }
+function escN(v){ return v == null ? v : escH(v); } // يحافظ على null/undefined لتظهر '—' كما كانت
+function escH(s){ return String(s == null ? '' : s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+// تشخيص مفصّل (كان يُطبع دائمًا في Console بما فيه أجزاء من الرد الخام): يعمل فقط عند window.ARRIVE_DEBUG = true
+function traceLog(){ if(window.ARRIVE_DEBUG) console.log.apply(console, arguments); }
 function safeStr(v){
   if(v === null || v === undefined) return '';
   if(v instanceof Date) return v.toISOString();
@@ -2780,6 +2792,7 @@ function buildData(raw){
       investigation_result: (d.investigation_result !== null && d.investigation_result !== undefined && d.investigation_result !== '') ? safeStr(d.investigation_result).trim() : null,
     };
   });
+  mapped.forEach(m=>{ for(const k in m){ if(typeof m[k]==='string' && !FREE_TEXT_FIELDS.has(k)) m[k]=safeTxt(m[k]); } });
   // Guard against duplicate/stray rows coming back from the source (Google Sheet
   // / Apps Script API): a legitimate complaint always has a "رقم الشكوى" (id).
   // Rows with no id (e.g. a trailing subtotal/summary row accidentally included
@@ -2891,7 +2904,7 @@ function computeAvgCompensationSla(rows){
 // with a searchable Autocomplete-style dropdown: type-to-filter, checkbox options,
 // selected values shown as removable chips, and Select All / Clear All actions.
 const multiSelectRegistry = {};
-function escapeHtmlAttr(s){ return String(s).replace(/"/g,'&quot;'); }
+function escapeHtmlAttr(s){ return escH(s); }
 
 function mountMultiSelect(id, opts={}){
   const sel = document.getElementById(id);
@@ -2964,7 +2977,7 @@ function mountMultiSelect(id, opts={}){
     const MAX_CHIPS = 2;
     let html = '';
     selected.slice(0, MAX_CHIPS).forEach(o=>{
-      html += `<span class="ms-chip" data-val="${escapeHtmlAttr(o.value)}"><span>${o.textContent}</span><button type="button" title="إزالة"><i class="fa-solid fa-xmark"></i></button></span>`;
+      html += `<span class="ms-chip" data-val="${escapeHtmlAttr(o.value)}"><span>${escH(o.textContent)}</span><button type="button" title="إزالة"><i class="fa-solid fa-xmark"></i></button></span>`;
     });
     if(selected.length > MAX_CHIPS) html += `<span class="ms-chip-more">+${selected.length - MAX_CHIPS}</span>`;
     chipsBox.innerHTML = html;
@@ -3657,7 +3670,7 @@ function updateTable(rows){
       <td>${d.complainant ?? ''}</td>
       <td>${(d.type||'').replace('شكوى تخص ','')}</td>
       <td>${d.branch ?? ''}</td>
-      <td class="content-cell" title="${(d.content||'').replace(/"/g,'&quot;')}">${d.content ?? ''}</td>
+      <td class="content-cell" title="${escH(d.content||'')}">${escH(d.content ?? '')}</td>
       <td>${statusBadge(d.status)}</td>
       <td class="amount-cell">${isCompensationCountable(d) ? d.compensation_amount.toLocaleString('en-US') : '—'}</td>
     </tr>
@@ -3704,14 +3717,14 @@ function openModal(d){
       ${field('نوع الشكوى', (d.type||'').replace('شكوى تخص ',''))}
       ${field('تصنيف المشكلة', d.classification)}
       ${field('رقم البوليصة', d.policy)}
-      ${fieldFull('محتوى الشكوى', d.content)}
-      ${field('نتيجة التحقيق', d.investigation_result)}
+      ${fieldFull('محتوى الشكوى', escN(d.content))}
+      ${field('نتيجة التحقيق', escN(d.investigation_result))}
       ${field('الحالة', statusBadge(d.status))}
       ${field('مبلغ التعويض', isCompensationCountable(d) ? d.compensation_amount.toLocaleString('en-US')+' ج.م' : '—')}
       ${field('يتحمل التعويض', d.compensation_bearer)}
       ${field('شهر التعويض', d.compensation_month)}
       ${field('SLA تنفيذ التعويض (يوم)', typeof d.sla_compensation_days==='number' ? d.sla_compensation_days : '—')}
-      ${fieldFull('ملاحظات', d.notes)}
+      ${fieldFull('ملاحظات', escN(d.notes))}
     </div>
   `;
   document.getElementById('overlay').classList.add('open');
@@ -4977,7 +4990,7 @@ document.getElementById('qaExport').addEventListener('click', ()=>{
   const rows = getFiltered();
   const cols = ['id','date_added','owner','complainant','type','branch','classification','status','compensation_amount','compensation_bearer','sla_resolution_days'];
   const headerLabels = ['رقم الشكوى','التاريخ','المسؤول','الشاكي','النوع','الفرع','التصنيف','الحالة','التعويض','الجهة المتحملة','زمن الحل (يوم)'];
-  const escCsv = v => `"${String(v??'').replace(/"/g,'""')}"`;
+  const escCsv = csvCell;
   const lines = [headerLabels.map(escCsv).join(',')];
   rows.forEach(d=> lines.push(cols.map(c=>escCsv(d[c])).join(',')));
   const csv = '\uFEFF' + lines.join('\r\n');
@@ -5115,7 +5128,7 @@ function renderTablePage(){
       <td>${d.complainant ?? ''}</td>
       <td>${(d.type||'').replace('شكوى تخص ','')}</td>
       <td>${d.branch ?? ''}</td>
-      <td class="content-cell" title="${(d.content||'').replace(/"/g,'&quot;')}">${d.content ?? ''}</td>
+      <td class="content-cell" title="${escH(d.content||'')}">${escH(d.content ?? '')}</td>
       <td>${statusBadge(d.status)}</td>
       <td class="amount-cell">${isCompensationCountable(d) ? d.compensation_amount.toLocaleString('en-US') : '—'}</td>
     </tr>
@@ -5221,7 +5234,7 @@ function hideSkeleton(){
 const connStatusChip = document.getElementById('connStatusChip');
 const connStatusLabel = document.getElementById('connStatusLabel');
 function setConnStatus(state){
-  console.log('%c[TRACE] setConnStatus("'+state+'") called from:', 'color:#e67e22;font-weight:bold', new Error().stack);
+  traceLog('%c[TRACE] setConnStatus("'+state+'") called from:', 'color:#e67e22;font-weight:bold', new Error().stack);
   if(!connStatusChip) return;
   connStatusChip.dataset.state = state;
   const labels = { live:'متصل', demo:'وضع تجريبي', error:'غير متصل' };
@@ -5230,14 +5243,14 @@ function setConnStatus(state){
 
 // ---------- Demo-mode banner (non-blocking) ----------
 const demoModeBanner = document.getElementById('demoModeBanner');
-function showDemoModeBanner(){ console.log('[TRACE] showDemoModeBanner()'); demoModeBanner?.classList.remove('hidden'); setConnStatus('demo'); }
-function hideDemoModeBanner(){ console.log('[TRACE] hideDemoModeBanner() -> setConnStatus(live)'); demoModeBanner?.classList.add('hidden'); setConnStatus('live'); }
+function showDemoModeBanner(){ traceLog('[TRACE] showDemoModeBanner()'); demoModeBanner?.classList.remove('hidden'); setConnStatus('demo'); }
+function hideDemoModeBanner(){ traceLog('[TRACE] hideDemoModeBanner() -> setConnStatus(live)'); demoModeBanner?.classList.add('hidden'); setConnStatus('live'); }
 
 // ---------- Slim non-blocking banner for connection problems (initial load + background refresh) ----------
 const refreshBanner = document.getElementById('refreshBanner');
 const refreshBannerMsg = document.getElementById('refreshBannerMsg');
 function showRefreshBanner(kind){
-  console.log('%c[TRACE] showRefreshBanner("'+kind+'") called from:', 'color:#e74c3c;font-weight:bold', new Error().stack);
+  traceLog('%c[TRACE] showRefreshBanner("'+kind+'") called from:', 'color:#e74c3c;font-weight:bold', new Error().stack);
   if(!refreshBanner) return;
   const presets = {
     'error': 'تعذّر الاتصال بالخادم — سيتم الاحتفاظ بآخر بيانات متاحة. اضغط "إعادة المحاولة الآن" أو تحقق من رابط الـ API من الإعدادات.',
@@ -5248,7 +5261,7 @@ function showRefreshBanner(kind){
   refreshBanner.classList.remove('hidden');
   if(kind === 'error') setConnStatus('error');
 }
-function hideRefreshBanner(){ console.log('[TRACE] hideRefreshBanner()'); refreshBanner?.classList.add('hidden'); }
+function hideRefreshBanner(){ traceLog('[TRACE] hideRefreshBanner()'); refreshBanner?.classList.add('hidden'); }
 
 // ---------- Settings modal (API URL) — always reachable, never disabled ----------
 function openSettingsModal(){
@@ -5369,41 +5382,41 @@ function mapApiRows(rows){
 
 // ---------- Fetch ----------
 async function fetchDashboardData(){
-  console.log('%c[TRACE] fetchDashboardData() START, currentApiUrl =', 'color:#2980b9;font-weight:bold', currentApiUrl);
+  traceLog('%c[TRACE] fetchDashboardData() START, currentApiUrl =', 'color:#2980b9;font-weight:bold', currentApiUrl);
   let res;
   try{
     const controller = new AbortController();
     const timeoutId = setTimeout(()=>controller.abort(), 120000); // allow up to 2 minutes for slow formula-driven sheets
     try{
       res = await fetch(currentApiUrl, { method:'GET', cache:'no-store', signal: controller.signal });
-      console.log('[TRACE] fetch() resolved. status=', res.status, 'ok=', res.ok, 'type=', res.type, 'redirected=', res.redirected, 'url=', res.url);
+      traceLog('[TRACE] fetch() resolved. status=', res.status, 'ok=', res.ok, 'type=', res.type, 'redirected=', res.redirected, 'url=', res.url);
     }finally{
       clearTimeout(timeoutId);
     }
   }catch(networkErr){
-    console.error('[TRACE] fetch() THREW (network/CORS layer):', networkErr && networkErr.name, networkErr && networkErr.message, networkErr);
+    traceLog('[TRACE] fetch() THREW (network/CORS layer):', networkErr && networkErr.name, networkErr && networkErr.message, networkErr);
     const err = new Error('network'); err.kind = 'error'; err.cause = networkErr; throw err;
   }
   if(!res.ok){
-    console.error('[TRACE] res.ok === false. HTTP status:', res.status, res.statusText);
+    traceLog('[TRACE] res.ok === false. HTTP status:', res.status, res.statusText);
     const err = new Error('http-'+res.status); err.kind = 'error'; throw err;
   }
   let json;
   try{
     const rawText = (await res.text()).replace(/^\uFEFF/, '').trim();
-    console.log('[TRACE] raw response length =', rawText.length, ' first 200 chars =', rawText.slice(0,200));
+    traceLog('[TRACE] raw response length =', rawText.length, ' first 200 chars =', rawText.slice(0,200));
     json = JSON.parse(rawText);
-    console.log('[TRACE] JSON.parse succeeded. typeof json =', typeof json, Array.isArray(json) ? '(array, len '+json.length+')' : Object.keys(json||{}));
+    traceLog('[TRACE] JSON.parse succeeded. typeof json =', typeof json, Array.isArray(json) ? '(array, len '+json.length+')' : Object.keys(json||{}));
   }catch(parseErr){
-    console.error('[TRACE] JSON.parse THREW:', parseErr);
+    traceLog('[TRACE] JSON.parse THREW:', parseErr);
     const err = new Error('bad-json'); err.kind = 'error'; err.cause = parseErr; throw err;
   }
   const rows = Array.isArray(json) ? json : (json && Array.isArray(json.data) ? json.data : null);
   if(!rows){
-    console.error('[TRACE] Unexpected JSON shape (expected an array or {data:[...]}):', json);
+    traceLog('[TRACE] Unexpected JSON shape (expected an array or {data:[...]}):', json);
     const err = new Error('bad-format'); err.kind = 'error'; throw err;
   }
-  console.log('[TRACE] rows extracted, count =', rows.length, ' sample row =', rows[0]);
+  traceLog('[TRACE] rows extracted, count =', rows.length, ' sample row =', rows[0]);
   // NOTE: mapApiRows() is a pure data-normalization step — the HTTP request has
   // already succeeded at this point. If it throws (e.g. an unexpected value type
   // in a sheet column), that is NOT a connectivity problem, so it is tagged with
@@ -5411,28 +5424,28 @@ async function fetchDashboardData(){
   // from being misreported to the user as "Disconnected" / "Failed to connect".
   try{
     const mapped = mapApiRows(rows);
-    console.log('[TRACE] mapApiRows() succeeded, mapped count =', mapped.length);
+    traceLog('[TRACE] mapApiRows() succeeded, mapped count =', mapped.length);
     return mapped;
   }catch(mapErr){
-    console.error('[TRACE] mapApiRows() THREW — connection is fine, data shape is not:', mapErr);
+    traceLog('[TRACE] mapApiRows() THREW — connection is fine, data shape is not:', mapErr);
     const err = new Error('mapping-failed'); err.kind = 'mapping'; err.cause = mapErr; throw err;
   }
 }
 
 function renderDataset(raw){
-  console.log('[TRACE] renderDataset() START, raw count =', raw && raw.length);
+  traceLog('[TRACE] renderDataset() START, raw count =', raw && raw.length);
   DATA = buildData(raw);
-  console.log('[TRACE] buildData() OK, DATA.length =', DATA.length);
+  traceLog('[TRACE] buildData() OK, DATA.length =', DATA.length);
   populateFilters();
-  console.log('[TRACE] populateFilters() OK');
+  traceLog('[TRACE] populateFilters() OK');
   updateMetaBar();
-  console.log('[TRACE] updateMetaBar() OK');
+  traceLog('[TRACE] updateMetaBar() OK');
   drawBarcodes();
-  console.log('[TRACE] drawBarcodes() OK');
+  traceLog('[TRACE] drawBarcodes() OK');
   updateFooterInfo();
-  console.log('[TRACE] updateFooterInfo() OK');
+  traceLog('[TRACE] updateFooterInfo() OK');
   render();
-  console.log('[TRACE] render() OK — renderDataset() COMPLETE');
+  traceLog('[TRACE] render() OK — renderDataset() COMPLETE');
   if(typeof refreshCompareValueOptions === 'function') refreshCompareValueOptions();
   if(compareModeActive && typeof renderComparePanels === 'function') renderComparePanels();
 }
@@ -5476,12 +5489,12 @@ async function loadDashboardData(opts){
   if(!isRefresh){ showSkeleton(); }
 
   try{
-    console.log('%c[TRACE] loadDashboardData() try block: calling fetchDashboardData()', 'color:#2980b9');
+    traceLog('%c[TRACE] loadDashboardData() try block: calling fetchDashboardData()', 'color:#2980b9');
     const raw = await fetchDashboardData();
-    console.log('[TRACE] fetchDashboardData() RESOLVED, raw.length =', raw.length);
+    traceLog('[TRACE] fetchDashboardData() RESOLVED, raw.length =', raw.length);
 
     if(!raw.length){
-      console.log('[TRACE] raw is empty -> showRefreshBanner("empty")');
+      traceLog('[TRACE] raw is empty -> showRefreshBanner("empty")');
       showRefreshBanner('empty');
     }else{
       try{
@@ -5494,18 +5507,18 @@ async function loadDashboardData(opts){
         const err = new Error('render-failed'); err.kind = 'render'; err.cause = renderErr;
         throw err;
       }
-      console.log('%c[TRACE] renderDataset() completed without throwing', 'color:#27ae60');
+      traceLog('%c[TRACE] renderDataset() completed without throwing', 'color:#27ae60');
       hideDemoModeBanner();
       hideRefreshBanner();
       hasLiveDataOnce = true;
       saveDataToCache(raw);
-      console.log('%c[TRACE] loadDashboardData() SUCCESS PATH COMPLETE — status should be "live"', 'color:#27ae60;font-weight:bold');
+      traceLog('%c[TRACE] loadDashboardData() SUCCESS PATH COMPLETE — status should be "live"', 'color:#27ae60;font-weight:bold');
     }
   }catch(err){
     // Always surface the real error in the console — previously this catch block
     // discarded it entirely, which is why the API/network could be perfectly fine
     // while the UI silently flipped to "Disconnected" with no trace of *why*.
-    console.error('%c[TRACE] loadDashboardData() CATCH — err.kind =', 'color:#e74c3c;font-weight:bold', err && err.kind, err, err && err.cause ? { cause: err.cause } : '');
+    traceLog('%c[TRACE] loadDashboardData() CATCH — err.kind =', 'color:#e74c3c;font-weight:bold', err && err.kind, err, err && err.cause ? { cause: err.cause } : '');
 
     // Only a genuine connectivity failure (network unreachable, non-2xx HTTP status,
     // or unparsable JSON — all explicitly tagged err.kind === 'error' by
@@ -5517,7 +5530,7 @@ async function loadDashboardData(opts){
     // any exception thrown inside renderDataset()'s sub-functions (not just buildData(),
     // which was already hardened) was still being mislabeled as "Disconnected".
     const isConnectivityError = !!(err && err.kind === 'error');
-    console.log('[TRACE] isConnectivityError =', isConnectivityError);
+    traceLog('[TRACE] isConnectivityError =', isConnectivityError);
 
     // Keep whatever is currently on screen (demo data, cached data, or last good live data)
     // and just surface a small, non-blocking notification with a retry option. If we have
@@ -5835,7 +5848,7 @@ function exportPanelCsv(suf){
   const rows = getFilteredForPanel(suf);
   const cols = ['id','date_added','owner','complainant','type','branch','classification','status','compensation_amount','compensation_bearer','sla_resolution_days'];
   const headerLabels = ['رقم الشكوى','التاريخ','المسؤول','الشاكي','النوع','الفرع','التصنيف','الحالة','التعويض','الجهة المتحملة','زمن الحل (يوم)'];
-  const escCsv = v => `"${String(v??'').replace(/"/g,'""')}"`;
+  const escCsv = csvCell;
   const lines = [headerLabels.map(escCsv).join(',')];
   rows.forEach(d=> lines.push(cols.map(c=>escCsv(d[c])).join(',')));
   const csv = '\uFEFF' + lines.join('\r\n');
@@ -6132,7 +6145,8 @@ document.getElementById('headerReport')?.addEventListener('click', ()=>{ if(wind
       return url;
     }catch(e){ console.warn('report chart failed', e); return ''; }
   }
-  const liveChart = name => { try{ return eval(name); }catch(e){ return null; } };
+  // بدل eval(name): أسماء الرسوم ثابتة ومعروفة (متغيرات let على مستوى السكربت)
+  const liveChart = name => { try{ return ({ chartType:()=>chartType, chartBranch:()=>chartBranch, chartClassification:()=>chartClassification, chartBearer:()=>chartBearer }[name] || (()=>null))(); }catch(e){ return null; } };
 
   /* ---------- page shell ---------- */
   function page(inner, opts){
