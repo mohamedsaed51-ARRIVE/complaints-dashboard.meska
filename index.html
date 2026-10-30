@@ -10,6 +10,918 @@
 <link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700;800&family=Inter:wght@400;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<script id="i18nCore">
+/* ARRIVE — طبقة اللغة (Arabic / English)
+ * - الواجهة تُترجم عبر قاموس (I18N.add) يعمل على عقد النص والسمات (title / placeholder / aria-label) مع مراقبة تغييرات DOM،
+ *   فلا تتأثر دوال الحساب ولا قيم الفلاتر؛ النص الأصلي العربي يُحفظ على العقدة ويُستعاد عند الرجوع للعربية.
+ * - مولّدا التقرير والعرض التقديمي يستخدمان I18N.t / I18N.isEn / I18N.L مباشرة عند بناء المحتوى.
+ */
+(function(){
+  'use strict';
+  const KEY = 'arrive_dashboard_lang';
+  const AR = /[؀-ۿ]/;
+  const ARW = '؀-ۿ';
+  let lang = 'ar';
+  try{ if(localStorage.getItem(KEY) === 'en') lang = 'en'; }catch(e){}
+
+  const D = Object.create(null);   // exact:  normalized Arabic  ->  English
+  const P = [];                    // whole-string patterns: [RegExp, fn]
+  const cache = new Map();
+  let FR = null;                   // fragment regex (built lazily)
+  const norm = s => String(s).replace(/\s+/g, ' ').trim();
+  const esc = s => s.replace(/[.*+?^${}()|[\]\\\/]/g, '\\$&');
+
+  const DN = Object.create(null);  // orthography-insensitive copy (أ إ آ -> ا ، ة -> ه ، ى -> ي)
+  const orth = s => s.replace(/[أإآٱ]/g, 'ا').replace(/ة/g, 'ه').replace(/ى/g, 'ي').replace(/[\u064B-\u0652\u0640]/g, '');
+  function add(o){ Object.keys(o).forEach(k => { const n = norm(k); D[n] = o[k]; DN[orth(n)] = o[k]; }); FR = null; cache.clear(); }
+  // pattern: Arabic template with {0},{1}… placeholders -> English template (placeholders are translated recursively)
+  function pat(ar, en){
+    const parts = ar.split(/\{\d+\}/);
+    const rx = new RegExp('^' + parts.map(p => esc(p).replace(/\s+/g, '\\s+')).join('(.+?)') + '$', 's');
+    const lit = parts.join('').length;
+    P.push([rx, m => typeof en === 'function' ? en(...m.slice(1).map(x => t(x))) : en.replace(/\{(\d+)\}/g, (_, i) => t(m[+i + 1])), lit]);
+    P.sort((a, b) => b[2] - a[2]);   // most specific (longest literal text) first
+    cache.clear();
+  }
+  // same as pat() but placeholders only match numbers / dates / percentages (safe for very short templates)
+  function patN(ar, en){
+    const parts = ar.split(/\{\d+\}/);
+    const rx = new RegExp('^' + parts.map(p => esc(p).replace(/\s+/g, '\\s+')).join('([\\d.,\\-−+%]+)') + '$');
+    const lit = parts.join('').length;
+    P.push([rx, m => en.replace(/\{(\d+)\}/g, (_, i) => m[+i + 1]), lit]);
+    P.sort((a, b) => b[2] - a[2]); cache.clear();
+  }
+  // units that follow a number: "5 شكاوى" -> "5 complaints"
+  const UNITS = [
+    [/شكوى|شكاوى|شكاوي/, 'complaint', 'complaints'], [/يومًا|يوما|يوم|أيام|ايام/, 'day', 'days'],
+    [/حالة|حالات/, 'case', 'cases'], [/سجلًا|سجلا|سجلات|سجل/, 'record', 'records'],
+    [/فرعًا|فرعا|فروع|فرع/, 'branch', 'branches'], [/مسؤولي|مسؤولين|مسؤولًا|مسؤول/, 'handler', 'handlers'],
+    [/شحنات|شحنة/, 'shipment', 'shipments'], [/راسلين|راسلًا|راسلون|راسل/, 'sender', 'senders'],
+    [/بندًا|بنود|بند/, 'item', 'items'], [/أسباب|سبب/, 'reason', 'reasons'], [/دقائق|دقيقة/, 'minute', 'minutes']
+  ];
+  const UNIT_RX = new RegExp('(^|[^' + ARW + '\\w.])(\\d[\\d,]*(?:\\.\\d+)?)\\s*(' + UNITS.map(u => u[0].source).join('|') + ')(?![' + ARW + '])', 'g');
+  function units(s){
+    return s.replace(UNIT_RX, (m, pre, num, word) => {
+      const u = UNITS.find(x => new RegExp('^(?:' + x[0].source + ')$').test(word));
+      const n = parseFloat(num.replace(/,/g, ''));
+      return pre + num + ' ' + (n === 1 ? u[1] : u[2]);
+    });
+  }
+  // single-word entries are whole-text matches only (never spliced into longer Arabic sentences) unless forced via I18N.frag()
+  const FORCE = new Set();
+  function forceFrag(o){ Object.keys(o).forEach(k => { FORCE.add(norm(k)); }); add(o); }
+  function frag(){
+    if(FR) return FR;
+    const keys = Object.keys(D).filter(k => AR.test(k) && (FORCE.has(k) || / /.test(k))).sort((a, b) => b.length - a.length);
+    if(!keys.length) keys.push('\u0000');
+    FR = new RegExp('(?<![' + ARW + '])(?:' + keys.map(k => esc(k).replace(/ /g, '\\s+')).join('|') + ')(?![' + ARW + '])', 'g');
+    return FR;
+  }
+  // exactOnly: used for data cells (names, free text) so they are never half-translated
+  function t(s, exactOnly){
+    if(lang !== 'en' || s == null || s === '') return s;
+    s = String(s);
+    if(!AR.test(s)) return s;
+    const ck = (exactOnly ? '1' : '0') + s;
+    if(cache.has(ck)) return cache.get(ck);
+    let out;
+    const lead = s.match(/^\s*/)[0], trail = s.match(/\s*$/)[0], core = norm(s);
+    if(D[core] !== undefined) out = lead + D[core] + trail;
+    else if(DN[orth(core)] !== undefined) out = lead + DN[orth(core)] + trail;
+    else if(exactOnly){ out = s; ENT.forEach(([rx, rp]) => { out = out.replace(rx, rp); }); }
+    else {
+      out = null;
+      for(const [rx, fn] of P){ const m = core.match(rx); if(m){ out = lead + fn(m) + trail; break; } }
+      if(out === null){
+        const lv = core.match(/^([^:：]{2,45}):\s*(.+)$/s);   // "label: value"
+        if(lv && (D[norm(lv[1])] !== undefined || DN[orth(norm(lv[1]))] !== undefined)){ out = lead + t(lv[1]) + ': ' + t(lv[2]) + trail; }
+      }
+      if(out === null){
+        // short mixed strings ("مندوب — 4 cases"): translate each separated piece exactly
+        const loose = core.split(/(\s[—·|\-]\s|،\s*|\s\/\s)/).map((piece, i) => (i % 2 ? piece : (D[norm(piece)] !== undefined ? D[norm(piece)] : DN[orth(norm(piece))] !== undefined ? DN[orth(norm(piece))] : t(piece, true)))).join('');
+        if(core.split(/\s+/).length <= 8 && loose !== core && !AR.test(units(loose))){ out = lead + units(loose) + trail; }
+      }
+      if(out === null){
+        out = s; ENT.forEach(([rx, rp]) => { out = out.replace(rx, rp); });
+        out = units(out).replace(frag(), m => D[norm(m)] !== undefined ? D[norm(m)] : m);
+      }
+    }
+    if(cache.size > 6000) cache.clear();
+    cache.set(ck, out);
+    return out;
+  }
+  const ENT = [];
+  function ent(rx, rep){ ENT.push([rx, rep]); cache.clear(); }
+  const CTX = [];   // [selector, {arabic: english}] — wins over the global dictionary inside matching containers
+  function ctx(sel, map){ CTX.push([sel, map]); cache.clear(); }
+  const L = (ar, en) => lang === 'en' ? en : ar;
+  const isEn = () => lang === 'en';
+  const plural = (n, one, many) => Math.abs(n) === 1 ? one : many;
+
+  /* ---------- DOM ---------- */
+  const ATTRS = ['title', 'placeholder', 'aria-label', 'alt', 'data-tip'];
+  const SKIP_TAG = { SCRIPT:1, STYLE:1, TEXTAREA:1, CODE:1, NOSCRIPT:1 };
+  const EXACT_SEL = '#tableBody, .drilldown-table tbody, .ms-option, .ms-chip, .pg pre, .pg-quote, .pg-q > b, .pg dd, #pgSel option';
+  const closestFlag = (el, attr) => {
+    for(let n = el; n && n.nodeType === 1; n = n.parentNode){ if(n.hasAttribute && n.hasAttribute(attr)) return n.getAttribute(attr) === 'exact' ? 'exact' : 'skip'; }
+    return (el.closest && el.closest(EXACT_SEL)) ? 'exact' : null;
+  };
+  let busy = false;
+
+  function xText(node){
+    const p = node.parentNode; if(!p || SKIP_TAG[p.nodeName]) return;
+    const v = node.nodeValue;
+    if(node.__ar !== undefined && v === node.__tr) return;          // already translated by us
+    if(!AR.test(v)) return;
+    const flag = closestFlag(p, 'data-i18n');
+    if(flag === 'skip') return;
+    let out;
+    for(const [sel, map] of CTX){ if(p.closest && p.closest(sel) && map[norm(v)] !== undefined){ out = map[norm(v)]; break; } }
+    if(out === undefined) out = t(v, flag === 'exact');
+    if(out !== v){ node.__ar = v; node.__tr = out; node.nodeValue = out; }
+  }
+  function xAttrs(el){
+    if(!el.getAttribute) return;
+    const flag = closestFlag(el, 'data-i18n'); if(flag === 'skip') return;
+    ATTRS.forEach(a => {
+      const v = el.getAttribute(a); if(v == null || !AR.test(v)) return;
+      const out = t(v, flag === 'exact');
+      if(out !== v){ el['__ar_' + a] = v; el.setAttribute(a, out); }
+    });
+  }
+  function sweep(root){
+    if(!root) return;
+    busy = true;
+    try{
+      if(root.nodeType === 3){ xText(root); return; }
+      if(root.nodeType !== 1 && root.nodeType !== 9) return;
+      if(root.nodeType === 1){ xAttrs(root); }
+      const w = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT);
+      let n; while((n = w.nextNode())){ if(n.nodeType === 3) xText(n); else xAttrs(n); }
+    } finally { busy = false; }
+  }
+  function restore(){
+    busy = true;
+    try{
+      const w = document.createTreeWalker(document.documentElement, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT);
+      let n; while((n = w.nextNode())){
+        if(n.nodeType === 3){ if(n.__ar !== undefined){ if(n.nodeValue === n.__tr) n.nodeValue = n.__ar; n.__ar = undefined; n.__tr = undefined; } }
+        else ATTRS.forEach(a => { const k = '__ar_' + a; if(n[k] !== undefined){ n.setAttribute(a, n[k]); n[k] = undefined; } });
+      }
+    } finally { busy = false; }
+  }
+  let mo = null;
+  function observe(){
+    if(mo) return;
+    mo = new MutationObserver(recs => {
+      if(busy || lang !== 'en') return;
+      busy = true;
+      try{
+        recs.forEach(r => {
+          if(r.type === 'childList'){ r.addedNodes.forEach(n => { if(n.nodeType === 3) xText(n); else if(n.nodeType === 1) sweepEl(n); }); }
+          else if(r.type === 'characterData'){ xText(r.target); }
+          else if(r.type === 'attributes'){ xAttrs(r.target); }
+        });
+      } finally { busy = false; }
+    });
+    mo.observe(document.documentElement, { subtree:true, childList:true, characterData:true, attributes:true, attributeFilter:ATTRS });
+  }
+  function sweepEl(root){   // like sweep() but assumes busy already set
+    xAttrs(root);
+    const w = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT);
+    let n; while((n = w.nextNode())){ if(n.nodeType === 3) xText(n); else xAttrs(n); }
+  }
+
+  function applyShell(){
+    const h = document.documentElement;
+    h.lang = lang; h.dir = lang === 'en' ? 'ltr' : 'rtl';
+    h.classList.toggle('lang-en', lang === 'en'); h.classList.toggle('lang-ar', lang !== 'en');
+    const b = document.getElementById('langToggle');
+    if(b){ b.querySelector('.lt-label').textContent = lang === 'en' ? 'العربية' : 'English'; b.title = lang === 'en' ? 'التبديل إلى العربية' : 'Switch to English'; b.setAttribute('aria-label', b.title); }
+  }
+  const hooks = [];
+  function onChange(fn){ hooks.push(fn); }
+  function setLang(l){
+    l = l === 'en' ? 'en' : 'ar';
+    if(l === lang) return;
+    lang = l;
+    try{ localStorage.setItem(KEY, l); }catch(e){}
+    cache.clear();
+    applyShell();
+    if(lang === 'en'){ sweep(document.documentElement); } else { restore(); }
+    document.title = lang === 'en' ? t(document.documentElement.__arTitle || document.title) : (document.documentElement.__arTitle || document.title);
+    hooks.forEach(fn => { try{ fn(lang); }catch(e){ console.error(e); } });
+    if(lang === 'en') sweep(document.documentElement);
+  }
+  function boot(){
+    document.documentElement.__arTitle = document.title;
+    applyShell();
+    const b = document.getElementById('langToggle');
+    if(b) b.addEventListener('click', () => setLang(lang === 'en' ? 'ar' : 'en'));
+    if(lang === 'en'){ document.title = t(document.title); sweep(document.documentElement); }
+    observe();
+  }
+
+  if(lang === 'en') applyShell();   // no right-to-left flash while the page boots
+  window.I18N = { add, frag:forceFrag, pat, patN, ctx, ent, t, L, isEn, plural, set:setLang, get:() => lang, onChange, sweep, boot,
+                  dict:D, rtl:() => lang !== 'en' };
+})();
+
+/* قاموس الواجهة: الترويسة، الفلاتر، المؤشرات، الرسوم، الجداول، الإعدادات */
+I18N.add({
+/* ---- shell / header ---- */
+'ARRIVE | لوحة متابعة الشكاوى (نسخة تجريبية)':'ARRIVE | Complaints Tracking Dashboard (Demo)',
+'نسخة تجريبية — جميع البيانات وهمية ومعدّلة للعرض، وغير مرتبطة بأي مصدر بيانات حقيقي':'Demo version — all data is fictitious, adjusted for display, and not linked to any real data source',
+'وضع تجريبي — لم يتم ربط Google Sheets بعد.':'Demo mode — Google Sheets is not connected yet.',
+'إعدادات الاتصال':'Connection settings',
+'المراجعة التشغيلية':'Operational Audit',
+'نظام متابعة الشكاوى والتعويضات':'Complaints & Compensation Tracking System',
+'إصدار تقرير إداري':'Generate management report',
+'إصدار تقرير':'Generate report',
+'إنشاء عرض تقديمي (PowerPoint) من البيانات الحالية':'Create a PowerPoint presentation from the current data',
+'عرض تقديمي':'Presentation',
+'وضع المقارنة':'Comparison mode',
+'إغلاق وضع المقارنة':'Close comparison mode',
+'تصدير البيانات':'Export data',
+'تصدير':'Export',
+'الإعدادات':'Settings',
+'إعدادات':'Settings',
+'الوضع الداكن':'Dark mode',
+'الوضع الفاتح':'Light mode',
+'السياسات':'Policies',
+'دليل السياسات':'Policy guide',
+'لوحة متابعة الشكاوى':'Complaints Tracking Dashboard',
+'تتبّع حالة الشكاوى، التعويضات، وأداء الفروع':'Track complaint status, compensation and branch performance',
+'آخر تحديث للبيانات':'Last data update',
+'آخر تحديث':'Last updated',
+'متصل':'Connected',
+'غير متصل':'Offline',
+'وضع تجريبي':'Demo mode',
+'إجمالي الشكاوى':'Total complaints',
+'فرعًا مشمولًا':'Branches covered',
+'إجمالي التعويض (ج.م)':'Total compensation (EGP)',
+'الوقت الحالي':'Current time',
+'إجمالي السجلات':'Total records',
+'عوامل التصفية النشطة':'Active filters',
+'السجلات المعروضة':'Records shown',
+'تحديث اللوحة':'Refresh dashboard',
+'إعادة التصفية':'Reset filters',
+'تصدير CSV':'Export CSV',
+'طباعة':'Print',
+'ملء الشاشة':'Full screen',
+'الفترة المشمولة:':'Period covered:',
+'الفترة:':'Period:',
+'مصدر البيانات':'Data source',
+'عدد السجلات':'Record count',
+'سجل':'record',
+'ج.م':'EGP',
+'ج':'EGP',
+/* ---- filters ---- */
+'عوامل التصفية':'Filters',
+'نتيجة':'results',
+'كل الفلاتر / إخفاء الإضافية':'All filters / hide extra',
+'كل الفلاتر':'All filters',
+'مسح الفلاتر':'Clear filters',
+'بحث (اسم، بوليصة، محتوى)':'Search (name, waybill, content)',
+'اكتب للبحث…':'Type to search…',
+'بحث:':'Search:',
+'مسؤول الشكوى':'Complaint handler',
+'الفرع المتسبب':'Responsible branch',
+'نوع الشكوى':'Complaint type',
+'حالة الشكوى':'Complaint status',
+'شهر إضافة الشكوى':'Complaint month',
+'تاريخ الشكوى من':'Complaint date from',
+'تاريخ الشكوى إلى':'Complaint date to',
+'تصنيف المشكلة':'Issue classification',
+'شهر التعويض':'Compensation month',
+'اسم الراسل':'Sender name',
+'وظيفة المتحمل للتعويض':'Compensation bearer role',
+'نتيجة مراجعة التعويض':'Compensation review result',
+'التأكيد على المراجعة':'Review confirmation',
+'تم التأكيد':'Confirmed',
+'لم يتم التأكيد':'Not confirmed',
+'تاريخ المراجعة من':'Review date from',
+'تاريخ المراجعة إلى':'Review date to',
+'الكل':'All',
+'تحديد الكل':'Select all',
+'مسح الكل':'Clear all',
+'لا توجد نتائج':'No results',
+'إزالة':'Remove',
+'إزالة هذا الفلتر':'Remove this filter',
+'الفلاتر النشطة:':'Active filters:',
+'تاريخ الشكوى:':'Complaint date:',
+'إخفاء الفلاتر':'Hide filters',
+'إظهار الفلاتر':'Show filters',
+/* ---- KPI section ---- */
+'مؤشرات':'Indicators',
+'المؤشرات الرئيسية':'Key indicators',
+'محسوبة ضمن عوامل التصفية الحالية':'Calculated within the current filters',
+'نسبة قبول التعويض':'Compensation acceptance rate',
+'قيد التحقيق':'Under investigation',
+'الالتزام بـ SLA التحقيق':'Investigation SLA compliance',
+'الالتزام بـ SLA التعويض':'Compensation SLA compliance',
+'متوسط زمن الحل:':'Avg. resolution time:',
+'متوسط زمن تنفيذ التعويض:':'Avg. compensation execution time:',
+'متوسط زمن الحل':'Avg. resolution time',
+'متوسط زمن تنفيذ التعويض':'Avg. compensation execution time',
+'متوسط زمن الحل (يوم)':'Avg. resolution time (days)',
+'يوم':'days',
+'أيام':'days',
+'يومًا':'days',
+'أداء':'Performance',
+'مؤشر أداء مسؤولي الشكاوى':'Complaint handler performance index',
+'درجة من 100 لكل مسؤول شكوى بناءً على معدل الإغلاق، الالتزام بـ SLA، متوسط زمن الحل، والشكاوى المفتوحة':'A score out of 100 per handler based on closure rate, SLA compliance, average resolution time and open complaints',
+'إجمالي الشكاوى المسندة':'Total assigned complaints',
+'الشكاوى المغلقة':'Closed complaints',
+'الشكاوى المفتوحة':'Open complaints',
+'الالتزام بـ SLA':'SLA compliance',
+'رضا العملاء':'Customer satisfaction',
+'درجة الأداء':'Performance score',
+'الاتجاه':'Trend',
+'الأدمن':'Admin',
+'عدد الحالات':'Number of cases',
+'عدد الشكاوى':'Number of complaints',
+'حالات':'cases',
+'شكوى':'complaint',
+'شكاوى':'complaints',
+'شكاوي':'complaints',
+'مسؤول':'handler',
+/* ---- trends / charts ---- */
+'اتجاهات':'Trends',
+'الاتجاهات والتوزيعات':'Trends & distributions',
+'اضغط على أي عنصر داخل الرسم البياني لتصفية اللوحة بأكملها':'Click any item in a chart to filter the entire dashboard',
+'اضغط على أي عنصر داخل الرسم البياني لتصفية اللوحة بأكملها بحسب هذا العنصر.':'Click any item in a chart to filter the entire dashboard by that item.',
+'الشكاوى حسب الفرع':'Complaints by branch',
+'أعلى 10 فروع من حيث عدد الشكاوى':'Top 10 branches by number of complaints',
+'توزيع الشكاوى حسب نوعها الرئيسي':'Complaints by main type',
+'أكثر 8 أسباب تكرارًا':'Top 8 most frequent reasons',
+'التعويض حسب الجهة المتحملة':'Compensation by bearing party',
+'إجمالي مبلغ التعويض (ج.م) وعدد الحالات لكل وظيفة متحملة':'Total compensation (EGP) and number of cases per bearing role',
+'استثناءات':'Exceptions',
+'مركز التنبيهات التنفيذي':'Executive alert center',
+'تنبيهات مصنّفة (حرج / تحذير / معلومة) ومرتبة تلقائيًا حسب الخطورة — تختفي فور تحسّن الحالة':'Alerts classified (critical / warning / info) and auto-sorted by severity — they disappear as soon as the situation improves',
+'مؤشر':'Indicator',
+'مؤشر الصحة التنفيذي':'Executive health index',
+'درجة موزونة (0-100) من معدل الإغلاق، الالتزام بـ SLA، زمن الحل، نسبة الشكاوى المعلّقة، تكلفة التعويضات، ونمو الشكاوى — الأوزان مقترحة وغير معتمدة رسميًا، والدرجة مؤشر تلخيصي لا يغني عن الشكاوى الحرجة':'A weighted score (0–100) from closure rate, SLA compliance, resolution time, pending-complaint share, compensation cost and complaint growth — weights are proposed and not officially approved; the score is a summary indicator and does not replace reviewing critical complaints',
+'إجراءات':'Actions',
+'مركز الإجراءات التنفيذية':'Executive action center',
+'إجراءات إدارية مقترحة تلقائيًا مع الأولوية، الجهة المسؤولة، والأثر المتوقع':'Automatically proposed management actions with priority, responsible party and expected impact',
+'رؤى':'Insights',
+'رؤى ذكية للإدارة':'Smart insights for management',
+'رؤى ومقارنات وتوصيات تُبنى آليًا بقواعد برمجية من البيانات الحالية — لا تُغيّر أي حساب أو رسم بياني قائم':'Insights, comparisons and recommendations built automatically by programmatic rules from the current data — they do not change any existing calculation or chart',
+'بطاقات الرؤى التنفيذية':'Executive insight cards',
+'مقارنة الأداء':'Performance comparison',
+'أبرز أسباب الشكاوى':'Top complaint reasons',
+'توصيات ذكية للإدارة':'Smart recommendations for management',
+'مبنية على قواعد آلية — وليست ذكاءً اصطناعيًا خارجيًا':'Based on automatic rules — not external artificial intelligence',
+'رؤى تفصيلية':'Detailed insights',
+'لكل رؤية: المشكلة، الأثر على الأعمال، الإجراء الموصى به، والأولوية — مبنية بقواعد برمجية من البيانات الحالية':'For each insight: the problem, business impact, recommended action and priority — built by programmatic rules from the current data',
+'ترتيب':'Ranking',
+'أفضل وأضعف الأداء':'Best & weakest performance',
+'تصنيفات تلقائية لأفضل وأضعف 5 مسؤولين، وأبرز أسباب الشكاوى وتكاليف التعويض':'Automatic rankings of the best and weakest 5 handlers, top complaint reasons and compensation costs',
+'أفضل 5 مسؤولي شكاوى':'Top 5 complaint handlers',
+'أضعف 5 مسؤولي شكاوى':'Bottom 5 complaint handlers',
+'أعلى أسباب تكلفة التعويض':'Top compensation cost reasons',
+/* ---- table ---- */
+'سجل الشكاوى':'Complaints log',
+'اضغط على أي صف لعرض التفاصيل الكاملة · الفرز بالضغط على عنوان العمود':'Click any row to see full details · Sort by clicking a column header',
+'رقم الشكوى':'Complaint no.',
+'التاريخ':'Date',
+'المسؤول':'Handler',
+'الشاكي':'Complainant',
+'النوع':'Type',
+'الفرع':'Branch',
+'المحتوى':'Content',
+'الحالة':'Status',
+'التعويض':'Compensation',
+'رقم البوليصة':'Waybill no.',
+'تاريخ الأضافة':'Date added',
+'اسم المخطىء':'Faulty person',
+'وظيفة المخطىء':'Faulty person role',
+'نتيجة التحقيق':'Investigation result',
+'تاريخ نتيجة التحقيق':'Investigation result date',
+'حالة الشكوى الحاليه':'Current complaint status',
+'التأكيد على المراجعه':'Review confirmation',
+'تارخ المراجعه':'Review date',
+'مبلغ التعويض المستحق':'Compensation amount due',
+'وظيفه المتحمل':'Bearer role',
+'نتيجه مراجعة التعويض':'Compensation review result',
+'رقم بوليصه التعويض':'Compensation waybill no.',
+'تاريخ التعويض':'Compensation date',
+'ملاحظات':'Notes',
+'التصنيف':'Classification',
+'الجهة المتحملة':'Bearing party',
+'زمن الحل (يوم)':'Resolution time (days)',
+'عرض':'Show',
+'سجل · صفحة':'records · page',
+'الصفحة الأولى':'First page',
+'السابق':'Previous',
+'التالي':'Next',
+'الصفحة الأخيرة':'Last page',
+'عدد الصفوف في الصفحة':'Rows per page',
+'/ صفحة':'/ page',
+'لا توجد سجلات ضمن الفلاتر الحالية':'No records match the current filters',
+/* ---- compare mode ---- */
+'اختر عاملاً أو أكثر للمقارنة، وستظهر لكل عامل مختار قائمة قيمة مستقلة في كل لوحة':'Choose one or more factors to compare; each chosen factor gets an independent value list in every panel',
+'قارن حسب (اختر عاملاً أو أكثر)':'Compare by (choose one or more factors)',
+'الراسل':'Sender',
+'الجهة المتحملة للتعويض':'Compensation bearing party',
+'حالة تأكيد المراجعة':'Review confirmation status',
+'الشهر':'Month',
+'تتم إضافة عوامل التصفية العامة (التاريخ، الشهر، إلخ) تلقائيًا كأساس للمقارنة، ثم تُطبَّق فوقها كل القيم المختارة (بينها AND) لكل لوحة على حدة.':'The global filters (date, month, etc.) are added automatically as the comparison base, then all selected values (combined with AND) are applied on top of them for each panel separately.',
+'عدد اللوحات المقارنة':'Number of comparison panels',
+'لوحتان (2)':'Two panels (2)',
+'ثلاث لوحات (3)':'Three panels (3)',
+'مزامنة القيم (الأولى ← الباقي)':'Sync values (first → others)',
+'تبديل الأولى والثالثة':'Swap first and third',
+'تبديل الأولى والثانية':'Swap first and second',
+'اللوحة الأولى':'Panel 1',
+'اللوحة الثانية':'Panel 2',
+'اللوحة الثالثة':'Panel 3',
+'الأولى':'First',
+'الثانية':'Second',
+'الثالثة':'Third',
+'تصدير بيانات اللوحة الأولى':'Export Panel 1 data',
+'تصدير بيانات اللوحة الثانية':'Export Panel 2 data',
+'تصدير بيانات اللوحة الثالثة':'Export Panel 3 data',
+'تعويضات مرفوضة':'Rejected compensations',
+'لا توجد بيانات كافية للمقارنة':'Not enough data to compare',
+'إجمالي التعويضات (ج.م)':'Total compensation (EGP)',
+'إجمالي التعويض':'Total compensation',
+'إجمالي التعويضات':'Total compensation',
+'مرفوضة من أصل':'rejected out of',
+/* ---- footer / settings ---- */
+'لوحة متابعة الشكاوى — ARRIVE':'Complaints Tracking Dashboard — ARRIVE',
+'أُعدّت بواسطة':'Prepared by',
+'إدارة المراجعة التشغيلية':'Operational Audit Department',
+'إصدار اللوحة':'Dashboard version',
+'ملف تتبع الشكاوى الداخلي':'Internal complaints tracking file',
+'عدد السجلات':'Record count',
+'إعادة المحاولة الآن':'Retry now',
+'إعدادات مصدر البيانات':'Data source settings',
+'إغلاق':'Close',
+'لم يتم إعداد رابط الـ API بعد. أدخل الرابط أدناه واضغط':'The API link has not been set up yet. Enter the link below and press',
+'حفظ والاتصال':'Save & connect',
+'لتفعيل جلب البيانات.':'to enable data fetching.',
+'رابط الـ Google Apps Script API':'Google Apps Script API link',
+'يتم حفظ الرابط محليًا على هذا الجهاز فقط (localStorage). ستقوم اللوحة بجلب البيانات من هذا الرابط تلقائيًا حسب فاصل التحديث المحدد أدناه.':'The link is stored locally on this device only (localStorage). The dashboard will fetch data from this link automatically at the refresh interval selected below.',
+'التحديث التلقائي':'Auto refresh',
+'إيقاف':'Off',
+'كل دقيقة':'Every minute',
+'كل 5 دقائق':'Every 5 minutes',
+'كل 15 دقيقة':'Every 15 minutes',
+'كل 30 دقيقة':'Every 30 minutes',
+'تحديث الآن':'Refresh now',
+'تعذّر الاتصال بالخادم — سيتم الاحتفاظ بآخر بيانات متاحة. اضغط':'Could not reach the server — the last available data will be kept. Press',
+'أو تحقق من رابط الـ API من الإعدادات.':'or check the API link in Settings.',
+'تم الاتصال بالخادم بنجاح، ولكن لم يتم العثور على أي سجلات.':'Connected to the server successfully, but no records were found.',
+'تم استلام البيانات من الخادم بنجاح، ولكن حدث خطأ أثناء عرضها. راجع Console للتفاصيل.':'Data was received from the server, but an error occurred while displaying it. See the Console for details.',
+'آخر بيانات محفوظة محليًا:':'Last data saved locally:',
+'لا توجد بيانات محفوظة محليًا بعد.':'No locally saved data yet.',
+'غير محدد':'Not specified',
+'غير مصنف':'Unclassified',
+'غير محسوم':'Undecided',
+'(فارغ)':'(empty)',
+'رقم شكوى فارغ':'Empty complaint number',
+'رقم شكوى غير صالح':'Invalid complaint number',
+/* ---- months ---- */
+'يناير':'January','فبراير':'February','مارس':'March','أبريل':'April','ابريل':'April','مايو':'May','يونيو':'June',
+'يوليو':'July','أغسطس':'August','اغسطس':'August','سبتمبر':'September','أكتوبر':'October','اكتوبر':'October','نوفمبر':'November','ديسمبر':'December',
+/* ---- data categories ---- */
+'مقبول':'Accepted','مرفوض':'Rejected','معوّض سابقًا':'Previously compensated','مقبولة':'Accepted','مرفوضة':'Rejected',
+'تم قبول التعويض':'Compensation accepted','تم رفض التعويض':'Compensation rejected','جارى التحقيق':'Under investigation',
+'التعويض مسبقا':'Previously compensated','تم التعويض مسبقا':'Previously compensated',
+'قبول':'Acceptance','رفض':'Rejection','مسبقا':'previously','معلقة':'Pending','جارى':'In progress','التحقيق':'Investigation',
+'مراجعة الشكاوي':'Complaint review','رد الشكاوي':'Complaint reply',
+'شكوى تخص المرتجعات':'Returns complaint','شكوى تخص التوصيل':'Delivery complaint','شكوى تخص الحسابات':'Accounts complaint','شكوى تخص أداء المناديب':'Courier performance complaint',
+'وزن زائد':'Excess weight','شحنه هالكه':'Damaged shipment','مرتجع مفقود':'Lost return','مرتجع متبدل':'Swapped return','خطأ راسل':'Sender error','سلوك مندوب':'Courier behavior',
+'شحنه مفقوده':'Lost shipment','عدم تنفيذ طلب خاص بالعميل':'Customer request not fulfilled','تاخير مرتجع':'Delayed return','تبديل بوالص':'Waybill swap',
+'الشركه':'Company','وكيل':'Agent','مندوب':'Courier','موظف اوبريشين':'Operations employee','خطأ وكيل':'Agent error',
+'المرتجعات':'Returns','الشرقيه':'Sharqia','الرئيسى':'Head office','البحيره':'Beheira','المنوفيه':'Monufia','الهرم':'Haram','الصعيد':'Upper Egypt','القليوبيه':'Qalyubia',
+'مدينه نصر':'Nasr City','اسكندريه':'Alexandria','حدائق القبه':'Hadayek El Qobba','المؤسسه':'Foundation','القاهرة':'Cairo','الجيزة':'Giza','الإسكندرية':'Alexandria',
+'الدقهلية':'Dakahlia','الشرقية':'Sharqia','الغربية':'Gharbia','المنوفية':'Monufia','القليوبية':'Qalyubia','البحيرة':'Beheira','كفر الشيخ':'Kafr El Sheikh','دمياط':'Damietta',
+'بورسعيد':'Port Said','الإسماعيلية':'Ismailia','السويس':'Suez','الفيوم':'Fayoum','بني سويف':'Beni Suef','المنيا':'Minya','أسيوط':'Assiut','سوهاج':'Sohag','قنا':'Qena',
+'الأقصر':'Luxor','أسوان':'Aswan','مطروح':'Matrouh','جنوب سيناء':'South Sinai','شمال سيناء':'North Sinai','البحر الأحمر':'Red Sea','الوادي الجديد':'New Valley',
+'مدينة نصر':'Nasr City','المعادي':'Maadi','التجمع':'New Cairo','أكتوبر':'October','العبور':'Obour','الشروق':'Shorouk','شبرا':'Shubra','المهندسين':'Mohandessin',
+'دمنهور':'Damanhour','طنطا':'Tanta','المنصورة':'Mansoura','الزقازيق':'Zagazig','بنها':'Benha','شبين الكوم':'Shebin El Kom',
+'ضمن النتائج الحالية':'within the current results','ضمن عوامل التصفية الحالية':'within the current filters',
+/* ---- misc UI ---- */
+'لا توجد بيانات كافية':'Not enough data','لا توجد بيانات':'No data','هدف':'target','الهدف:':'Target:','الهدف':'Target',
+'جديد':'New','مستقر':'Stable','= مستقر':'= stable','— مستقر':'— stable','حرج':'Critical','مرتفع':'High','منخفض':'Low','متوسط':'Medium','تحذير':'Warning','معلومة':'Info',
+'ممتاز':'Excellent','جيد':'Good','يحتاج انتباه':'Needs attention','يحتاج متابعة':'Needs follow-up','يتطلب متابعة':'Requires follow-up','يتطلب تدخلاً عاجلاً':'Requires urgent intervention',
+'الأداء ضمن الحدود المستهدفة':'Performance within target limits',
+'الصحة العامة':'Overall health','حالة اليوم':"Today's status",'من 100':'out of 100','تفصيل الوزن المحسوب':'Calculated weight breakdown',
+'معدل إغلاق الشكاوى':'Complaint closure rate','متوسط التعويض':'Average compensation','متوسط الشكاوى لكل مسؤول شكاوى':'Average complaints per handler',
+'نسبة الشكاوى المعلّقة':'Pending complaints share','تكلفة التعويضات':'Compensation cost','نمو حجم الشكاوى':'Complaint volume growth',
+'الأولوية':'Priority','الجهة المسؤولة':'Responsible party','الأثر المتوقع':'Expected impact','المشكلة':'Problem','الأثر على الأعمال':'Business impact','الإجراء الموصى به':'Recommended action',
+'اضغط للتصفية':'Click to filter','رؤية ذكية':'Smart insight',
+'النسبة من الإجمالي':'Share of total','من الإجمالي':'of total','يحتاج':'needs',
+'مراجعة الشكاوى المتأخرة':'Review overdue complaints','متابعة مسؤولي الشكاوى ضعيفي الأداء':'Follow up on low-performing handlers','مراجعة ارتفاع تكلفة التعويضات':'Review rising compensation cost',
+'التحقيق في ارتفاع حجم الشكاوى':'Investigate the rise in complaint volume','تحسين الالتزام بمهلة SLA':'Improve SLA compliance',
+'مدير العمليات':'Operations Manager','مدير جودة خدمة العملاء':'Customer Service Quality Manager','الإدارة المالية':'Finance Department',
+'تقليل خطر تصعيد العملاء وتراكم الشكاوى المفتوحة':'Reduce the risk of customer escalation and a build-up of open complaints',
+'رفع مستوى الالتزام بـ SLA وتقليل الشكاوى المفتوحة لكل مسؤول شكاوى':'Raise SLA compliance and reduce open complaints per handler',
+'ضبط التكلفة التشغيلية المرتبطة بالتعويضات قبل تفاقمها':'Control compensation-related operating cost before it escalates',
+'تحديد السبب الجذري قبل أن يتحول الارتفاع إلى نمط دائم':'Identify the root cause before the rise becomes a permanent pattern',
+'رفع رضا العملاء وتقليل خطر التصعيد المرتبط بتأخر الحل':'Improve customer satisfaction and reduce escalation risk linked to slow resolution',
+'لا توجد إجراءات عاجلة مطلوبة ضمن عوامل التصفية الحالية':'No urgent actions required within the current filters',
+'لا توجد تنبيهات نشطة ضمن عوامل التصفية الحالية':'No active alerts within the current filters',
+'لا توجد تنبيهات إدارية عاجلة ضمن عوامل التصفية الحالية — الأداء ضمن الحدود المستهدفة.':'No urgent management alerts within the current filters — performance is within target limits.',
+'لا توجد بيانات كافية ضمن عوامل التصفية الحالية.':'Not enough data within the current filters.',
+'لا توجد بيانات كافية ضمن عوامل التصفية الحالية لعرض الملخص التنفيذي.':'Not enough data within the current filters to show the executive summary.',
+'لا توجد بيانات كافية ضمن عوامل التصفية الحالية لحساب مؤشر الصحة التنفيذي.':'Not enough data within the current filters to calculate the executive health index.',
+'لا توجد بيانات كافية ضمن عوامل التصفية الحالية لعرض الملخص السريع.':'Not enough data within the current filters to show the quick summary.',
+'لا توجد بيانات كافية ضمن عوامل التصفية الحالية لعرض رؤى تنفيذية.':'Not enough data within the current filters to show executive insights.',
+'لا توجد بيانات مسؤولي شكاوى ضمن عوامل التصفية الحالية':'No complaint handler data within the current filters',
+'لا توجد تصنيفات كافية':'Not enough classifications','لا توجد تصنيفات كافية لعرضها ضمن النتائج الحالية.':'Not enough classifications to display within the current results.',
+'لا توجد حالات تعويض':'No compensation cases','لا توجد شكاوى مفتوحة حاليًا':'No open complaints at the moment',
+'تفاصيل أداء':'Performance details','ضمن عوامل التصفية الحالية.':'within the current filters.','شكاوى مغلقة':'Closed complaints','شكاوى مفتوحة':'Open complaints',
+'الالتزام بمهلة SLA':'SLA deadline compliance',
+'شكاوى حرجة (بدون تكرار)':'Critical complaints (unique)','أفضل مسؤول شكاوى':'Best complaint handler','أضعف مسؤول شكاوى':'Weakest complaint handler',
+'أضعف مسؤول شكاوى أداءً':'Lowest-performing complaint handler','أعلى حجم شكاوى':'Highest complaint volume','أعلى قيمة تعويض':'Highest compensation amount',
+'أكثر سبب شكوى تكرارًا':'Most frequent complaint reason','أطول شكوى معلّقة':'Longest pending complaint','أعلى التزام بـ SLA':'Highest SLA compliance','أقل التزام بـ SLA':'Lowest SLA compliance',
+'مراجعة أداء':'Review performance of','معلّقة منذ':'pending for','شكوى #':'complaint #',
+'الدرجة العامة جيدة، وتوجد شكاوى حرجة تحتاج متابعة':'The overall score is good, and there are critical complaints that need follow-up',
+'اضغط لعرض التفاصيل':'Click for details',
+'عدد الشكاوى — مقارنة شهرية':'Number of complaints — monthly comparison','متوسط زمن الحل — مقارنة شهرية':'Average resolution time — monthly comparison',
+'عدد الشكاوى — آخر 7 أيام':'Number of complaints — last 7 days','متوسط زمن الحل — آخر 7 أيام':'Average resolution time — last 7 days',
+'مقابل':'versus','في الأسبوع السابق':'in the previous week','يوم في الأسبوع السابق':'days in the previous week',
+'لا تتوفر بيانات كافية لمقارنة شهرية (شهر واحد فقط ضمن النتائج الحالية).':'Not enough data for a monthly comparison (only one month in the current results).',
+'حجم يومي متتبع (14 يوم أخير)':'Daily tracked volume (last 14 days)','الإنجاز':'achieved',
+'شكاوى تجاوزت مدة الحل المستهدفة (4 أيام)':'Complaints that exceeded the target resolution time (4 days)',
+'شكاوى تجاوزت SLA':'Complaints that breached SLA',
+'مسؤولو شكاوى بهم ارتفاع سريع في عدد الشكاوى (آخر 7 أيام مقابل الأسبوع السابق)':'Handlers with a rapid rise in complaints (last 7 days vs. previous week)',
+'مسؤولو شكاوى بارتفاع سريع':'Handlers with a rapid rise',
+'شكاوى مقبولة بانتظار اعتماد قيمة التعويض':'Accepted complaints awaiting compensation value approval','بانتظار اعتماد التعويض':'Awaiting compensation approval',
+'شكاوى بدون نتيجة تحقيق مسجّلة':'Complaints with no recorded investigation result','بدون تحقيق':'No investigation',
+'شكاوى قيد التحقيق منذ أكثر من 5 أيام':'Complaints under investigation for more than 5 days','5 أيام':'5 days',
+'تعويضات مرتفعة بشكل غير معتاد':'Unusually high compensation',
+'مسؤولو شكاوى بتراجع ملحوظ في درجة الأداء خلال الفترة الحالية':'Handlers with a noticeable drop in performance score during the current period',
+'تراجع في أداء مسؤول الشكاوى':'Drop in complaint handler performance',
+'تشمل: الشكاوى قيد التحقيق + أي شكوى نتيجة مراجعة التعويض فيها «مراجعة الشكاوي» أو «رد الشكاوي» أو «معلقة». الفارغة لا تُحتسب مفتوحة بذاتها. تُحسب كل شكوى مرة واحدة برقمها.':'Includes: complaints under investigation + any complaint whose compensation review result is “Complaint review”, “Complaint reply” or “Pending”. Empty values are not counted as open by themselves. Each complaint is counted once by its number.',
+'يُحسب من: تاريخ نتيجة التحقيق − تاريخ إضافة الشكوى (للحالات ذات التاريخين الصحيحين فقط). الهدف: أقل من 4 أيام.':'Calculated from: investigation result date − complaint added date (valid-date cases only). Target: under 4 days.',
+'يُحسب من: تاريخ التعويض − تاريخ نتيجة التحقيق (للحالات ذات التاريخين الصحيحين فقط)':'Calculated from: compensation date − investigation result date (valid-date cases only)',
+'يُحسب: تاريخ نتيجة التحقيق − تاريخ إضافة الشكوى':'Calculated: investigation result date − complaint added date',
+'يُحسب: تاريخ التعويض − تاريخ نتيجة التحقيق':'Calculated: compensation date − investigation result date',
+'العدد الكلي للشكاوى ضمن عوامل التصفية الحالية. إجراء مقترح: راجع مسؤولي الشكاوى الأعلى مساهمة في مؤشر أداء مسؤولي الشكاوى.':'Total number of complaints within the current filters. Suggested action: review the handlers contributing most to the handler performance index.',
+'نسبة الحالات المقبولة من إجمالي الحالات المقررة (مقبول أو مرفوض). إجراء مقترح: قارن النسبة عبر الفروع لتحديد التفاوت في معايير القبول.':'Share of accepted cases out of all decided cases (accepted or rejected). Suggested action: compare the rate across branches to identify differences in acceptance criteria.',
+'شكاوى لم يُبتّ فيها بعد. إجراء مقترح: تابع الحالات المفتوحة منذ أكثر من 5 أيام عبر مركز التنبيهات.':'Complaints not yet decided. Suggested action: follow up cases open for more than 5 days through the alert center.',
+'نسبة الشكاوى التي حُلّت خلال 4 أيام أو أقل (تاريخ نتيجة التحقيق − تاريخ إضافة الشكوى)، للحالات التي لديها التاريخان فقط. متوسط زمن الحل معروض داخل البطاقة.':'Share of complaints resolved within 4 days or less (investigation result date − complaint added date), for cases that have both dates only. Average resolution time is shown inside the card.',
+'نسبة التعويضات التي نُفّذت خلال يومين أو أقل من تاريخ نتيجة التحقيق (تاريخ التعويض − تاريخ نتيجة التحقيق)، للحالات التي لديها التاريخان فقط. متوسط زمن تنفيذ التعويض معروض داخل البطاقة.':'Share of compensations executed within 2 days or less of the investigation result date (compensation date − investigation result date), for cases that have both dates only. Average compensation execution time is shown inside the card.',
+'تعويضات الشركة:':'Company compensation:','تعويضات الشركة = مجموع مبالغ التعويض للشكاوى التي الجهة المتحملة فيها «الشركة».':'Company compensation = sum of compensation amounts for complaints whose bearing party is “Company”.',
+'تصنيف':'classification'
+});
+I18N.frag({'ج.م':'EGP','،':',','—':'—'});
+
+/* قاموس الجمل والقوالب: المؤشرات، التنبيهات، الرؤى، الملخص التنفيذي */
+(function(){
+const P = I18N.pat, A = I18N.add;
+const pl = (n, a, b) => (parseFloat(String(n).replace(/,/g,'')) === 1 ? a : b);
+/* demo entities */
+I18N.ent(/مسؤول شكاوى (\d+)/g, 'Complaint handler $1');
+I18N.ent(/عميل تجريبي (\d+)/g, 'Demo customer $1');
+I18N.ent(/مندوب\/موظف تجريبي (\d+)/g, 'Demo courier/employee $1');
+I18N.ent(/الشاكي (\d+)/g, 'Complainant $1');
+const MON = {'يناير':'January','فبراير':'February','مارس':'March','أبريل':'April','ابريل':'April','مايو':'May','يونيو':'June','يوليو':'July','أغسطس':'August','اغسطس':'August','سبتمبر':'September','أكتوبر':'October','اكتوبر':'October','نوفمبر':'November','ديسمبر':'December'};
+I18N.ent(/(يناير|فبراير|مارس|أبريل|ابريل|مايو|يونيو|يوليو|أغسطس|اغسطس|سبتمبر|أكتوبر|اكتوبر|نوفمبر|ديسمبر)(?= \d{4}|$)/g, m => MON[m]);
+
+/* KPI sublines */
+P('الفترة: {0} — {1} · {2} سجل','Period: {0} — {1} · {2} records');
+P('{0} مقبولة من أصل {1} حالة تم البتّ فيها','{0} accepted out of {1} decided cases');
+P('{0} مرفوضة من أصل {1} حالة تم البتّ فيها','{0} rejected out of {1} decided cases');
+P('· الإنجاز {0}%','· Achieved {0}%');
+P('من أصل {0} شكوى','out of {0} complaints');
+A({'الهدف: أقل من':'Target: under','الهدف: الحل خلال':'Target: resolve within','الهدف: خلال':'Target: within','يوم من النتيجة':'days from the result','من':'of','عرض':'Showing','سجل · صفحة':'records · page',
+  'يُحسب: تاريخ التعويض − تاريخ نتيجة التحقيق · لا تتوفر حالات كافية':'Calculated: compensation date − investigation result date · not enough cases',
+  'يُحسب: تاريخ نتيجة التحقيق − تاريخ إضافة الشكوى · لا تتوفر حالات كافية':'Calculated: investigation result date − complaint added date · not enough cases',
+  'طباعة / حفظ PDF':'Print / Save PDF','جارٍ الإعداد…':'Preparing…'});
+P('يُحسب: تاريخ نتيجة التحقيق − تاريخ إضافة الشكوى · {0} حالة لديها التاريخان','Calculated: investigation result date − complaint added date · {0} cases have both dates');
+P('يُحسب: تاريخ التعويض − تاريخ نتيجة التحقيق · {0} حالة لديها التاريخان','Calculated: compensation date − investigation result date · {0} cases have both dates');
+/* alerts & actions */
+P('شكاوى بتعويض مرتفع بشكل غير معتاد (أكثر من ضعف متوسط التعويض الحالي البالغ {0} ج.م)','Complaints with unusually high compensation (more than double the current average compensation of {0} EGP)');
+P('مسؤولو شكاوى تجاوزوا الحد الأقصى المسموح للشكاوى المفتوحة ({0} شكوى)','Handlers who exceeded the maximum allowed open complaints ({0} complaints)');
+P('مسؤولو شكاوى تجاوزوا {0} شكوى مفتوحة','Handlers with more than {0} open complaints');
+P('إجمالي التعويضات ارتفع بنسبة {0}% في {1} مقارنة بـ {2}.','Total compensation rose by {0}% in {1} compared with {2}.');
+P('{0} شكوى قيد التحقيق منذ أكثر من {1} أيام دون حل.','{0} complaints under investigation for more than {1} days without resolution.');
+P('الالتزام الحالي بمهلة الحل ({0} أيام) هو {1}% فقط.','Current compliance with the resolution deadline ({0} days) is only {1}%.');
+P('حجم الشكاوى ارتفع بنسبة {0}% خلال آخر 7 أيام مقارنة بالأسبوع السابق — يُنصح بمتابعة السبب قبل تفاقمه.','Complaint volume rose by {0}% over the last 7 days compared with the previous week — follow up on the cause before it escalates.');
+P('{0} — درجة أداء أقل من {1}/{2}.','{0} — performance score below {1}/{2}.');
+/* executive summary cards */
+P('درجة الأداء {0}/{1} · {2} شكوى مسندة',(a,b,n)=>`Performance score ${a}/${b} · ${n} ${pl(n,'complaint','complaints')} assigned`);
+P('درجة الأداء {0}/{1} · {2} شكوى مفتوحة',(a,b,n)=>`Performance score ${a}/${b} · ${n} open ${pl(n,'complaint','complaints')}`);
+P('شكوى #{0} · {1}','Complaint #{0} · {1}');
+P('معلّقة منذ {0} يوم · {1}','Pending for {0} days · {1}');
+P('التزام {0}% بمهلة الحل المستهدفة','{0}% within the target resolution time');
+P('التزام {0}% فقط بمهلة الحل المستهدفة','Only {0}% within the target resolution time');
+P('{0} مقابل {1} في {2}','{0} vs. {1} in {2}');
+P('{0} مقابل {1} يوم في {2}','{0} vs. {1} days in {2}');
+P('{0} شكوى ({1}% من الإجمالي)',(n,x)=>`${n} ${pl(n,'complaint','complaints')} (${x}% of total)`);
+A({'أفضل مسؤول شكاوى':'Best complaint handler','أضعف مسؤول شكاوى أداءً':'Lowest-performing complaint handler'});
+/* recommendations & insights */
+P('— الالتزام بـ SLA حاليًا {0}% فقط، الأدنى بين مسؤولي الشكاوى.','— current SLA compliance is only {0}%, the lowest among complaint handlers.');
+A({'مراجعة أداء':'Review the performance of','دراسة السبب الجذري لـ':'Study the root cause of','إعادة توزيع الحمل على':'Redistribute the workload of'});
+P('— تجاوزوا {0} شكاوى مفتوحة لكل منهم، ما قد يؤخر زمن الحل.','— each exceeded {0} open complaints, which may delay resolution time.');
+P('— يمثل {0}% من الشكاوى المصنّفة ضمن النتائج الحالية.','— accounts for {0}% of the classified complaints within the current results.');
+P('متوسط زمن الحل الحالي {0} يوم، أعلى من المهلة المستهدفة ({1} أيام) — يُنصح بتسريع دورة المراجعة.','The current average resolution time is {0} days, above the target ({1} days) — speeding up the review cycle is recommended.');
+A({'مسؤول الشكاوى':'Handler','يتحمّل':'carries',
+  'السبب الأكثر تكرارًا هو':'The most frequent reason is','بنسبة':'accounting for','من الشكاوى المصنّفة.':'of the classified complaints.',
+  'تركّز الحمل على مسؤول واحد يزيد من خطر التأخير وتراجع جودة المراجعة عند الغياب أو الضغط.':'Workload concentrated on a single handler increases the risk of delays and lower review quality during absence or peak load.',
+  'إعادة توزيع جزء من الشكاوى الجديدة على مسؤولين آخرين لتقليل التركّز.':'Redistribute part of the new complaints to other handlers to reduce concentration.',
+  'نمط متكرر بهذا الحجم يشير غالبًا إلى مشكلة تشغيلية جذرية تغذّي حجم الشكاوى.':'A recurring pattern of this size usually points to a root operational problem that feeds complaint volume.',
+  'متوسط زمن حل الشكاوى ازداد بمقدار':'Average complaint resolution time increased by','متوسط زمن حل الشكاوى تحسّن بمقدار':'Average complaint resolution time improved by',
+  'تحسّن زمن الحل ينعكس إيجابًا على رضا العملاء ويقلل من تصعيد الشكاوى.':'Faster resolution reflects positively on customer satisfaction and reduces complaint escalation.',
+  'توثيق ما تغيّر في سير العمل هذا الشهر للحفاظ على التحسّن.':'Document what changed in the workflow this month to sustain the improvement.',
+  'مراجعة مراحل سير العمل الحالية لتحديد أسباب التأخير في هذا الشهر.':'Review the current workflow stages to identify the causes of delay this month.',
+  'تم رفض':'Rejected',
+  'نسبة رفض مرتفعة قد تعكس ضبطًا جيدًا للتكلفة، أو قد تشير لتفاوت في معايير المراجعة إذا كانت غير متسقة عبر الفروع.':'A high rejection rate may reflect good cost control, or may indicate inconsistent review criteria if they are not applied uniformly across branches.',
+  'مراجعة عينة من أسباب الرفض للتأكد من اتساق معايير القرار.':'Review a sample of rejection reasons to confirm that decision criteria are applied consistently.',
+  'الجهة الأعلى تحمّلًا لقيمة التعويضات هي':'The party bearing the highest compensation value is','بإجمالي':'with a total of',
+  'تركّز التكلفة المالية على جهة واحدة يزيد من التعرّض المالي المرتبط بأدائها.':'Concentrating the financial cost on a single party increases the financial exposure tied to its performance.',
+  'زمن حل أبطأ يرفع خطر تجاوز مهلة SLA المستهدفة':'Slower resolution raises the risk of exceeding the target SLA'});
+P('من إجمالي الشكاوى ضمن النتائج الحالية ({0} من {1}).','of total complaints within the current results ({0} of {1}).');
+P('فتح تحقيق جذري في سبب "{0}" مع الفريق التشغيلي المعني.','Open a root-cause investigation into the reason "{0}" with the relevant operations team.');
+P('يوم في {0} مقارنة بـ {1}.','days in {0} compared with {1}.');
+P('يوم في {0} مقارنة بـ {1}','days in {0} compared with {1}');
+P('زمن حل أبطأ يرفع خطر تجاوز مهلة SLA المستهدفة ({0} أيام) ويؤثر على رضا العملاء.','Slower resolution raises the risk of exceeding the target SLA ({0} days) and affects customer satisfaction.');
+P('من طلبات التعويض المقررة ({0} من {1} حالة).','of decided compensation requests ({0} of {1} cases).');
+P('ج.م ({0}% من إجمالي التعويضات).','EGP ({0}% of total compensation).');
+P('مراجعة الاتفاقيات أو إجراءات العمل مع "{0}" لتقليل تركّز المسؤولية المالية.','Review the agreements or work procedures with "{0}" to reduce the concentration of financial responsibility.');
+P('و {0} شكوى أخرى ضمن نفس النتيجة.','and {0} more complaints in the same result.');
+P('تفاصيل أداء {0} ضمن عوامل التصفية الحالية.','Performance details for {0} within the current filters.');
+P('شكاوى {0} ({1})','Complaints of {0} ({1})');
+P('الشكاوى ({0})','Complaints ({0})');
+P('الفترة المشمولة: {0} — {1}','Period covered: {0} — {1}');
+P('يُحسب من: تاريخ التعويض − تاريخ نتيجة التحقيق (للحالات ذات التاريخين الصحيحين فقط) · {0} حالة','Calculated from: compensation date − investigation result date (valid-date cases only) · {0} cases');
+P('يُحسب من: تاريخ نتيجة التحقيق − تاريخ إضافة الشكوى (للحالات ذات التاريخين الصحيحين فقط) · {0} حالة','Calculated from: investigation result date − complaint added date (valid-date cases only) · {0} cases');
+/* drill-downs / compare summary */
+P('الثانية عن الأولى: {0}','Second vs. first: {0}');
+P('الثالثة عن الثانية: {0}','Third vs. second: {0}');
+P('الثالثة عن الأولى: {0}','Third vs. first: {0}');
+A({'كل الشكاوى المصنّفة بهذا السبب ضمن عوامل التصفية الحالية.':'All complaints classified under this reason within the current filters.',
+   'محتوى الشكوى':'Complaint content','مبلغ التعويض':'Compensation amount','يتحمل التعويض':'Compensation borne by','SLA تنفيذ التعويض (يوم)':'Compensation execution SLA (days)',
+   'افحص حسب السياسة (من المخطئ؟)':'Check against policy (who is at fault?)','دليل السياسات: من يتحمل ومتى يُستحق التعويض':'Policy guide: who bears the cost and when compensation is due',
+   'نوع الشكوى / السياسة':'Complaint type / policy','اختر السياسة المناسبة لبدء الأسئلة.':'Select the appropriate policy to start the questions.',
+   'التوصيل':'Delivery','الحسابات':'Accounts','أداء المناديب':'Courier performance','المرتجعات':'Returns',
+   'الفرع':'Branch','المسؤول':'Handler'});
+})();
+
+/* قاموس التقرير الإداري (تقرير اللوحة + تقرير المقارنة) */
+(function(){
+const P = I18N.pat, A = I18N.add;
+A({
+'معاينة التقرير':'Report preview','تقرير الإدارة':'Management report','أداء الفروع':'Branch performance','التعويضات':'Compensation','الأسباب والراسلون':'Reasons & senders','مسؤولو الشكاوى':'Complaint handlers','النتائج والتوصيات':'Findings & recommendations','التحليل التفصيلي':'Detailed analysis','(تابع)':'(cont.)',
+'تقرير متابعة الشكاوى والتعويضات':'Complaints & Compensation Tracking Report','تقرير متابعة الشكاوى':'Complaints Tracking Report',
+'الفترة المشمولة':'Period covered','لا توجد (كل السجلات)':'None (all records)','تاريخ إصدار التقرير':'Report issue date','عوامل التصفية':'Filters',
+'مصدر البيانات: لوحة متابعة الشكاوى · جميع الأرقام محسوبة من السجلات المعروضة ضمن عوامل التصفية أعلاه':'Data source: Complaints Tracking Dashboard · all figures are calculated from the records shown within the filters above',
+'الغرض والنطاق':'Purpose & scope','الغرض من التقرير':'Purpose of the report',
+'عرض موقف الشكاوى والتعويضات ضمن النطاق المحدد أدناه، وقياس الأداء مقابل الأهداف المستخدمة في اللوحة، وتحديد البنود التي تحتاج إلى قرار أو إجراء من الإدارة.':'To present the position of complaints and compensation within the scope defined below, measure performance against the targets used in the dashboard, and identify the items that require a management decision or action.',
+'أهداف التقرير':'Report objectives','بيان حالة الشكاوى (المفتوحة والمغلقة) ونسبة قبول التعويض من الحالات المحسومة.':'State the complaint status (open and closed) and the compensation acceptance rate among decided cases.',
+'رصد الفروع والمسؤولين والأسباب الأكثر تأثيرًا، وربط التوصيات بالأرقام.':'Identify the most influential branches, handlers and reasons, and link recommendations to the figures.',
+'نطاق التقرير':'Report scope','البند':'Item','القيمة':'Value','الحالات المحسومة (قبول/رفض)':'Decided cases (accepted/rejected)','الجدول الحي المرتبط باللوحة، آخر تحديث:':'Live table linked to the dashboard, last updated:',
+'ملاحظات على جودة البيانات':'Data quality notes','لا توجد ملاحظات على جودة البيانات ضمن النطاق الحالي.':'No data quality notes within the current scope.',
+'الأهداف مقابل الفعلي':'Targets vs. actual','الأهداف مقابل الفعلي (تابع)':'Targets vs. actual (cont.)','المؤشر':'Indicator','الهدف':'Target','الفعلي':'Actual','الفرق عن الهدف':'Gap vs. target','محقق':'Met','غير محقق':'Not met','نسبة الشكاوى المفتوحة':'Open complaints rate',
+'نسبة القبول = المقبول ÷ (المقبول + المرفوض). الحالات قيد التحقيق وغير المحددة وحالة «التعويض مسبقا» لا تدخل في المقام.':'Acceptance rate = accepted ÷ (accepted + rejected). Cases under investigation, unspecified cases and the “Previously compensated” status are excluded from the denominator.',
+'نسبة المفتوحة = الشكاوى بحالة «جارى» أو «التحقيق» ÷ إجمالي السجلات.':'Open rate = complaints with status “In progress” or “Investigation” ÷ total records.',
+'نسبة المفتوحة = الشكاوى بحالة «جارى» أو «التحقيق» ÷ إجمالي سجلات المجموعة.':'Open rate = complaints with status “In progress” or “Investigation” ÷ total records of the group.',
+'الالتزام بمهلة SLA = الحالات المنجزة خلال المهلة ÷ الحالات التي لها التاريخان الصالحان.':'SLA compliance = cases completed within the deadline ÷ cases with both valid dates.',
+'الملخص التنفيذي':'Executive summary','ما يحتاج انتباه الإدارة':'What needs management attention','العدد':'Count','الخطورة':'Severity','حرجة':'Critical','مرتفعة':'High','متوسطة':'Medium','منخفضة':'Low',
+'أكثر أسباب الشكاوى تكرارًا':'Most frequent complaint reasons','ملخص المؤشرات الرئيسية':'Key indicators summary',
+'القيمة الكلية محسوبة على كل السجلات المعروضة. المقارنة بين نصفي الفترة: النصف الأول مقابل النصف الأخير من السجلات مرتبة بتاريخ الإضافة (نفس منهج اللوحة).':'The overall value is calculated on all displayed records. The comparison is between the two halves of the period: the first half vs. the last half of the records ordered by date added (same method as the dashboard).',
+'القيمة الكلية':'Overall value','النصف الأول':'First half','النصف الأخير':'Last half','التغيّر':'Change','مكوّنات مؤشر الصحة التنفيذي':'Executive health index components','العامل':'Factor','الوزن':'Weight','الدرجة (0–100)':'Score (0–100)',
+'الهدف والمؤشرات — الفروع':'Objective & indicators — Branches','تحديد الفروع المتسببة في أكبر حصة من الشكاوى والتعويضات لتوجيه المتابعة والمعالجة.':'Identify the branches responsible for the largest share of complaints and compensation to direct follow-up and remediation.',
+'عدد الفروع المتسببة':'Responsible branches','فروع مذكورة بالمصدر':'branches stated in the source','أعلى فرع شكاوى':'Top branch by complaints','من إجمالي الشكاوى':'of total complaints','شكاوى بلا فرع مذكور':'Complaints with no branch stated','من السجلات':'of records',
+'التحليل التفصيلي: الفروع والتوزيعات':'Detailed analysis: branches & distributions','أعلى الفروع من حيث عدد الشكاوى':'Top branches by number of complaints','توزيع الشكاوى حسب النوع':'Complaints by type','أكثر الأسباب تكرارًا':'Most frequent reasons',
+'الفروع المتسببة في الشكاوى':'Branches responsible for complaints','الشكاوى':'Complaints','النسبة':'Share','المفتوحة':'Open','الالتزام بمهلة الحل':'Resolution deadline compliance','غير مذكور بالمصدر':'Not stated in the source','غير محدد بالمصدر':'Not specified in the source',
+'الهدف والمؤشرات — التعويضات':'Objective & indicators — Compensation','بيان من يتحمل تكلفة التعويض، ومتابعة حالات القبول والمفتوح والالتزام بمهلة التحقيق، وتتبع الاتجاه شهريًا.':'State who bears the compensation cost, track accepted and open cases and compliance with the investigation deadline, and follow the monthly trend.',
+'عدد الشحنات':'Number of shipments','إجمالي سجلات الشكاوى المعروضة':'Total complaint records shown','شحنات تم التعويض عنها':'Shipments compensated','مبلغ التعويض':'Compensation amount','عدد المقبول':'Accepted count','عدد المفتوح':'Open count','الالتزام بمهلة التحقيق':'Investigation deadline compliance','الإجمالي':'Total',
+'الاتجاه الشهري':'Monthly trend','الشكاوى حسب شهر الإضافة':'Complaints by month added','الشهر محسوب من تاريخ إضافة الشكوى، وهو مستقل عن مقارنة نصفي الفترة في «ملخص المؤشرات».':'The month is calculated from the complaint added date and is independent of the half-period comparison in the “Indicators summary”.',
+'الهدف والمؤشرات — الأسباب والراسلون':'Objective & indicators — Reasons & senders','معرفة أكثر الأسباب والأنواع تكرارًا والراسلين الأكثر تأثيرًا، لمعالجة الأسباب المتكررة.':'Identify the most frequent reasons and types and the most influential senders, in order to address recurring causes.',
+'أكثر تصنيف مشكلة':'Most frequent issue classification','أكثر نوع شكوى':'Most frequent complaint type','عدد الراسلين':'Number of senders','راسلون مختلفون':'distinct senders','من إجمالي السجلات':'of total records',
+'الأسباب وأنواع الشكاوى':'Reasons & complaint types','حسب نوع الشكوى':'By complaint type','حسب تصنيف المشكلة':'By issue classification','الراسلون الأكثر شكاوى':'Senders with the most complaints','% من الشكاوى المسجلة':'% of recorded complaints',
+'الهدف والمؤشرات — مسؤولو الشكاوى':'Objective & indicators — Complaint handlers','متابعة حجم العمل والالتزام لدى مسؤولي الشكاوى. الدرجة المركبة أوزانها غير معتمدة، فيُنصح بالاعتماد على الأرقام الخام.':'Monitor workload and compliance among complaint handlers. The weights of the composite score are not approved, so relying on the raw figures is recommended.',
+'عدد مسؤولي الشكاوى':'Number of complaint handlers','متوسط الشكاوى لكل مسؤول':'Average complaints per handler','أعلى حمل لمسؤول واحد':'Highest load for one handler',
+'أداء مسؤولي الشكاوى':'Complaint handler performance','المغلقة':'Closed','متوسط الحل (يوم)':'Avg. resolution (days)','الدرجة':'Score','التقييم':'Rating','التقييم والدرجة كما تحسبهما اللوحة دون تعديل.':'Rating and score as calculated by the dashboard, without modification.',
+'الهدف والمؤشرات — النتائج والتوصيات':'Objective & indicators — Findings & recommendations','تحويل نتائج التحليل إلى ملاحظات وإجراءات مقترحة تحتاج اعتماد الإدارة قبل التنفيذ.':'Turn the analysis results into observations and proposed actions that need management approval before implementation.',
+'تنبيهات نشطة':'Active alerts','ملاحظات مرصودة':'Observations noted','إجراءات مقترحة':'Proposed actions','إجراءات عالية الأولوية':'High-priority actions','حرجة أو مرتفعة':'critical or high',
+'النتائج والملاحظات':'Findings & observations','م':'#','الملاحظة':'Observation','الأثر':'Impact','المسؤول / الحالة / الاستحقاق':'Owner / status / due date',
+'السبب الجذري والمسؤول والحالة وتاريخ الاستحقاق غير متوفرة في مصدر البيانات؛ لذلك لم تُستنتج ولم يُفترض لها قيم.':'Root cause, owner, status and due date are not available in the data source; therefore no values were inferred or assumed for them.',
+'التوصيات وخطة الإجراءات':'Recommendations & action plan','التأثير':'Impact','الإجراء المطلوب':'Required action',
+'المسؤول والأولوية كما تحددهما قواعد مركز الإجراءات في اللوحة. الحالة غير متوفرة في المصدر ولا تُعرض شارة حالة افتراضية.':'Owner and priority are as determined by the action-center rules in the dashboard. Status is not available in the source and no default status badge is shown.',
+'الختام ومنهجية الإعداد':'Conclusion & preparation methodology','أساس الإعداد':'Basis of preparation','عدد السجلات المشمولة:':'Records covered:',
+'الشكوى «مفتوحة» إذا كانت حالتها «جارى» أو «التحقيق»؛ الالتزام بمهلة التحقيق = نسبة الشكاوى المنجزة خلال':'A complaint is “open” if its status is “In progress” or “Investigation”; investigation deadline compliance = share of complaints completed within',
+'مقارنة الاتجاه تتم بين نصفي السجلات مرتبة بتاريخ الإضافة، وليست مقارنة بشهر تقويمي سابق.':'The trend comparison is between the two halves of the records ordered by date added; it is not a comparison with a previous calendar month.',
+'حدود التقرير':'Report limitations','ما ورد من تفسيرات في الملاحظات والتوصيات هو مخرجات قواعد اللوحة الآلية، ويحتاج اعتمادًا من الإدارة قبل اعتباره قرارًا.':'The interpretations in the observations and recommendations are outputs of the dashboard’s automatic rules and require management approval before being treated as a decision.',
+'إعداد':'Prepared by','مراجعة':'Reviewed by','اعتماد':'Approved by','نهاية التقرير':'End of report',
+/* compare report */
+'تقرير مقارنة الشكاوى والتعويضات':'Complaints & Compensation Comparison Report','تقرير مقارنة الشكاوى':'Complaints Comparison Report','عوامل التصفية العامة':'Global filters',
+'مصدر البيانات: لوحة متابعة الشكاوى · الأرقام محسوبة من سجلات كل لوحة بعد تطبيق الفلاتر العامة واختيارات المقارنة':'Data source: Complaints Tracking Dashboard · figures are calculated from the records of each panel after applying the global filters and the comparison selections',
+'مجموعات محددة باختيارات وضع المقارنة، وقياس كل مجموعة مقابل الأهداف المستخدمة في اللوحة، وإبراز الفروقات التي تحتاج إلى قرار أو متابعة من الإدارة.':'groups defined by the comparison-mode selections, measure each group against the targets used in the dashboard, and highlight the differences that need a management decision or follow-up.',
+'مقارنة حجم الشكاوى والمفتوح منها ونسبة قبول التعويض بين المجموعات.':'Compare complaint volume, open complaints and the compensation acceptance rate across groups.',
+'مقارنة الشحنات المعوَّض عنها ومبلغ التعويض والجهة المتحملة.':'Compare compensated shipments, compensation amount and the bearing party.',
+'رصد الفروع والأسباب والراسلين والمسؤولين الأكثر اختلافًا بين المجموعات.':'Identify the branches, reasons, senders and handlers that differ most between groups.',
+'المجموعة':'Group','الاختيار':'Selection','الحالات المحسومة':'Decided cases','الفترة':'Period',
+'لكل مجموعة نسبتها الفعلية مقابل الهدف، والنسبة بين الأقواس تفصيل الرقم.':'Each group shows its actual rate against the target; the figure in brackets breaks down the number.',
+'الأهداف المعروضة':'Targets shown',
+'مقارنة المؤشرات الرئيسية':'Key indicators comparison','أهم الأرقام':'Headline figures','مقبول (من المحسوم)':'Accepted (of decided)','المفتوح (من الشكاوى)':'Open (of complaints)','مبلغ التعويض (ج.م)':'Compensation amount (EGP)','جدول المؤشرات':'Indicators table','الفرق':'Difference','التغيّر %':'Change %','أفضل':'Better','أسوأ':'Worse','بدون تغيّر':'No change',
+'فروق النسب بالنقاط المئوية، وباقي المؤشرات بالقيمة المطلقة ونسبة التغيّر. «أفضل/أسوأ» حسب اتجاه المؤشر.':'Rate differences are in percentage points; other indicators use the absolute value and percentage change. “Better/Worse” follows the indicator’s direction.',
+'منهجية المقارنة':'Comparison methodology','عوامل التصفية العامة المطبقة على اللوحات:':'Global filters applied to the panels:',
+'قد تتداخل سجلات اللوحات إذا لم تكن الاختيارات متنافية؛ لذلك لا تُجمع أرقام اللوحات.':'Panel records may overlap if the selections are not mutually exclusive; therefore the panel figures are not added together.',
+'مقارنة الفروع المتسببة في الشكاوى والتعويضات بين المجموعات لتوجيه المتابعة والمعالجة.':'Compare the branches responsible for complaints and compensation across groups to direct follow-up and remediation.',
+'مقارنة الفروع':'Branch comparison','مقارنة التعويضات':'Compensation comparison','مقارنة الأسباب والأنواع':'Reasons & types comparison','مقارنة الراسلين':'Sender comparison','مقارنة مسؤولي الشكاوى':'Complaint handler comparison','مقارنة الاتجاه الشهري':'Monthly trend comparison',
+'مقارنة عدد الحالات المقبولة والمفتوحة والشحنات المعوَّض عنها ومبلغ التعويض والالتزام بمهلة التحقيق بين المجموعات.':'Compare the number of accepted and open cases, compensated shipments, compensation amount and investigation deadline compliance across groups.',
+'عدد المقبول (من المحسوم)':'Accepted count (of decided)','مقارنة أكثر الأسباب والأنواع تكرارًا وعدد الراسلين بين المجموعات.':'Compare the most frequent reasons and types and the number of senders across groups.',
+'مقارنة حجم العمل لدى مسؤولي الشكاوى بين المجموعات.':'Compare the workload of complaint handlers across groups.',
+'الهدف والمؤشرات — مسؤولو الشكاوى ':'Objective & indicators — Complaint handlers',
+'أعلى فرع':'Top branch','سجل ·':'record(s) ·','سجل.':'record(s).','أخرى':'Other','تعذّر إعداد التقرير. أعد المحاولة بعد تحديث اللوحة.':'The report could not be prepared. Try again after refreshing the dashboard.',
+'صفحة':'Page','لا توجد بيانات متاحة وفقًا للفلاتر المحددة.':'No data available for the selected filters.','محقق ':'Met'
+});
+P('الفترة: {0} → {1}','Period: {0} → {1}');
+P('قياس الالتزام بمهلة حل الشكوى: {0} أيام من تاريخ الإضافة حتى تاريخ نتيجة التحقيق.','Measure compliance with the complaint resolution deadline: {0} days from the date added to the investigation result date.');
+P('قياس الالتزام بمهلة تنفيذ التعويض: {0} يوم من تاريخ نتيجة التحقيق حتى تاريخ التعويض.','Measure compliance with the compensation execution deadline: {0} days from the investigation result date to the compensation date.');
+I18N.patN('{0} من {1}','{0} of {1}');
+P('{0} سجل بحالة «غير محدد»: يُحتسب ضمن «المغلقة» وفق التعريف المعتمد في قسم المنهجية، ويُستبعد من الحالات المحسومة (قبول/رفض).', n => `${n} ${n==1?'record':'records'} with status “Not specified”: counted as “Closed” per the definition approved in the methodology section, and excluded from decided cases (accepted/rejected).`);
+P('{0} سجل بلا تاريخ نتيجة تحقيق صالح: لا يدخل في حساب الالتزام بمهلة الحل.', n => `${n} ${n==1?'record':'records'} without a valid investigation result date: not included in the resolution-deadline compliance calculation.`);
+P('المقارنة محسوبة على السجلات المشمولة بعوامل التصفية الحالية ({0} سجل).','The comparison is calculated on the records covered by the current filters ({0} records).');
+P('{0}% أو أكثر','{0}% or more');
+P('أقل من {0}%','Under {0}%');
+I18N.patN('{0}% ({1} من {2})','{0}% ({1} of {2})');
+P('{0} نقطة','{0} pts');
+I18N.patN('({0} من {1})','({0} of {1})');
+P('الالتزام بمهلة حل الشكوى ({0} أيام)','Complaint resolution deadline compliance ({0} days)');
+P('الالتزام بمهلة تنفيذ التعويض ({0} يوم)','Compensation execution deadline compliance ({0} days)');
+P('الالتزام بمهلة التحقيق ({0} أيام)','Investigation deadline compliance ({0} days)');
+P('الالتزام بمهلة التحقيق ({0}','Investigation deadline compliance ({0}');
+P('{0}% من {1} حالة · متوسط {2} يوم','{0}% of {1} cases · avg. {2} days');
+P('{0}% من {1} حالة · متوسط {2}','{0}% of {1} cases · avg. {2}');
+P('{0} من {1} حالة · المهلة {2} أيام','{0} of {1} cases · deadline {2} days');
+P('{0} من {1} حالة · المهلة {2}','{0} of {1} cases · deadline {2}');
+P('المهلة {0} أيام','Deadline {0} days');
+P('صفحة {0} من {1}','Page {0} of {1}');
+P('الأهداف المعروضة ({0}% و{1}% و{2}%) هي القيم المستخدمة حاليًا في اللوحة.','The targets shown ({0}%, {1}% and {2}%) are the values currently used in the dashboard.');
+P('الالتزام بـ SLA (هدف {0} أيام)','SLA compliance (target {0} days)');
+P('تركّز أعلى {0} فروع','Concentration of top {0} branches');
+P('{0}% من السجلات','{0}% of records');
+P('الفرع = عمود «الفرع المتسبب». النسبة من إجمالي {0} سجل. مقبول/مرفوض من قرار الحالة؛ الحالات قيد التحقيق وغير المحددة و«التعويض مسبقا» خارجهما. الالتزام بمهلة الحل = المنجز خلال {1} أيام ÷ الحالات ذات التاريخين الصالحين. نسبة التعويض = تعويض الفرع ÷ إجمالي التعويضات ({2} ج.م). عدد الفروع: {3}.','Branch = the “Responsible branch” column. Shares are of the total {0} records. Accepted/rejected come from the case decision; cases under investigation, unspecified cases and “Previously compensated” are outside both. Resolution deadline compliance = completed within {1} days ÷ cases with both valid dates. Compensation share = branch compensation ÷ total compensation ({2} EGP). Number of branches: {3}.');
+P('من إجمالي {0} شحنة','of a total of {0} shipments');
+P('متوسط {0} ج.م للحالة','Average {0} EGP per case');
+P('{0}% من الحالات المحسومة','{0}% of decided cases');
+P('{0} من {1} حالة · المهلة','{0} of {1} cases · deadline');
+P('الجدول يشمل الحالات التي لها مبلغ تعويض مسجّل فقط ({0} من {1} سجل). الجهة من عمود «وظيفة المتحمل للتعويض».','The table includes only cases with a recorded compensation amount ({0} of {1} records). The party comes from the “Compensation bearer role” column.');
+P('تركّز أعلى {0} راسلين','Concentration of top {0} senders');
+P('النسبة من إجمالي {0} سجل. البنود الأقل تكرارًا مجمّعة تحت «أخرى».','Shares are of the total {0} records. Less frequent items are grouped under “Other”.');
+P('أعلى {0} راسلين من {1} راسلًا؛ يمثلون {2}% من إجمالي السجلات. الراسل من عمود «الشاكي». «% من الشكاوى المسجلة» = شكاوى الراسل ÷ إجمالي {3} شكوى مسجلة ضمن الفترة والفلاتر المعروضة.','Top {0} senders out of {1} senders; they represent {2}% of total records. Sender comes from the “Complainant” column. “% of recorded complaints” = the sender’s complaints ÷ total {3} complaints recorded within the period and filters shown.');
+P('{0}% من الشكاوى','{0}% of complaints');
+P('المهلة {0} أيام','Deadline {0} days');
+P('منها حرجة: {0}','of which critical: {0}');
+P('سجلًا، للفترة','records, for the period');
+P('عوامل التصفية: {0}.','Filters: {0}.');
+P('مصدر البيانات: الجدول الحي المرتبط باللوحة (Google Sheets عبر Apps Script)، وآخر تحديث:','Data source: the live table linked to the dashboard (Google Sheets via Apps Script), last updated:');
+P('الشكوى «مفتوحة» إذا كانت حالتها «جارى» أو «التحقيق»، وما عدا ذلك «مغلقة»؛ والالتزام بـ SLA = نسبة الشكاوى التي حُلّت خلال {0} أيام أو أقل.','A complaint is “open” if its status is “In progress” or “Investigation”, and “closed” otherwise; SLA compliance = share of complaints resolved within {0} days or less.');
+P('لا يتضمن مصدر البيانات حاليًا: السبب الجذري، المسؤول عن التنفيذ، حالة الإجراء، وتاريخ الاستحقاق؛ ولذلك تظهر «غير محدد بالمصدر».','The data source currently does not include: root cause, implementation owner, action status and due date; therefore “Not specified in the source” is shown.');
+/* compare report patterns */
+P('مقارنة {0} لوحات','Comparison of {0} panels');
+P('مقارنة أداء الشكاوى والتعويضات بين {0} {1}','Compare complaint and compensation performance across {0} {1}');
+P('قياس الالتزام بمهلة التحقيق ({0} أيام) ومهلة تنفيذ التعويض ({1} يوم) لكل مجموعة.','Measure compliance with the investigation deadline ({0} days) and the compensation execution deadline ({1} days) for each group.');
+P('الأهداف المعروضة ({0}% و{1}% و{2}%) هي القيم المستخدمة حاليًا في اللوحة.','The targets shown ({0}%, {1}% and {2}%) are the values currently used in the dashboard.');
+P('الفرق = {0} − {1} (آخر لوحة مقابل أول لوحة).','Difference = {0} − {1} (last panel vs. first panel).');
+P('الفرق = {0} − {1} (آخر لوحة مقابل أول لوحة). النسبة بين الأقواس = نسبة الرقم من أساسه في اللوحة نفسها (المقبول والمرفوض من الحالات المحسومة، والمفتوح والشحنات المعوَّض عنها من إجمالي الشكاوى). فروق النسب بالنقاط المئوية، وباقي المؤشرات بالقيمة المطلقة ونسبة التغيّر. «أفضل/أسوأ» حسب اتجاه المؤشر.','Difference = {0} − {1} (last panel vs. first panel). The percentage in brackets = the share of the figure from its base within the same panel (accepted and rejected out of decided cases; open and compensated shipments out of total complaints). Rate differences are in percentage points; other indicators use the absolute value and percentage change. “Better/Worse” follows the indicator’s direction.');
+P('النسبة بين الأقواس = نسبة البند من إجمالي شكاوى (أو تعويضات) اللوحة نفسها. الفرق = {0} − {1} (آخر لوحة مقابل أول لوحة).','The percentage in brackets = the item’s share of the same panel’s total complaints (or compensation). Difference = {0} − {1} (last panel vs. first panel).');
+P('الشكوى «مفتوحة» إذا كانت حالتها «جارى» أو «التحقيق»؛ الالتزام بمهلة التحقيق = نسبة الشكاوى المنجزة خلال {0} أيام ÷ الحالات ذات التاريخين الصالحين.','A complaint is “open” if its status is “In progress” or “Investigation”; investigation deadline compliance = share of complaints completed within {0} days ÷ cases with both valid dates.');
+P('عوامل التصفية العامة المطبقة على اللوحات: {0}','Global filters applied to the panels: {0}');
+P('معروض أعلى {0} بندًا.','Showing the top {0} items.');
+P('أعلى {0} بندًا.','Top {0} items.');
+})();
+I18N.frag({'(تابع)':'(cont.)','تابع':'cont.'});
+
+I18N.ctx('.report-overlay', {'الهدف:':'Objective:'});
+
+/* قاموس العرض التقديمي (PowerPoint) */
+(function(){
+const P = I18N.pat, N = I18N.patN, A = I18N.add;
+A({
+'تقرير متابعة الشكاوى والتعويضات':'Complaints & Compensation Tracking Report','شكرًا لكم':'Thank you',
+'إجمالي الشكاوى المسجلة':'Total complaints recorded','إجمالي مبالغ التعويضات (ج.م)':'Total compensation amount (EGP)','نسبة قبول التعويض من الحالات المحسومة':'Compensation acceptance rate of decided cases',
+'قيد التحقيق (مفتوحة)':'Under investigation (open)','حالات أخرى غير محسومة':'Other undecided cases','مبلغ التعويض (ج.م)':'Compensation amount (EGP)',
+'نسبة القبول = المقبول ÷ (المقبول + المرفوض). النسبة في الجدول من إجمالي الشكاوى. المفتوحة = حالة «جارى» أو «التحقيق».':'Acceptance rate = accepted ÷ (accepted + rejected). Percentages in the table are of total complaints. Open = status “In progress” or “Investigation”.',
+'التغيّر عن الشهر السابق':'Change vs. previous month','مبلغ التعويضات (ج.م) — النسبة من إجمالي الأشهر الثلاثة':'Compensation amount (EGP) — share of the three-month total',
+'مبالغ التعويضات (ج.م) — النسبة من إجمالي الشهرين':'Compensation amounts (EGP) — share of the two-month total',
+'عدد الحالات المقبولة':'Accepted cases','عدد الحالات المفتوحة':'Open cases','الشكاوى':'Complaints','التعويضات':'Compensation',
+'اتجاه عدد الشكاوى يختلف عن اتجاه مبالغ التعويضات؛ فالتكلفة تتأثر بنوع الحالات وقيمة التعويض وليس بعددها فقط.':'The complaint-count trend differs from the compensation-amount trend; cost is driven by case type and compensation value, not by count alone.',
+'الشهر حسب تاريخ إضافة الشكوى بغض النظر عن فلتر الشهر والتاريخ، مع بقية الفلاتر.':'Month is by complaint added date, regardless of the month and date filters, with all other filters applied.',
+'الشهر حسب تاريخ إضافة الشكوى؛ الشهر المختار والشهران السابقان له بغض النظر عن فلتر الشهر والتاريخ، مع بقية الفلاتر.':'Month is by complaint added date; the selected month and the two preceding months are shown regardless of the month and date filters, with all other filters applied.',
+'المسؤولية المالية: توزيع التعويضات حسب الجهة المتحملة':'Financial responsibility: compensation by bearing party','الجهة المتحملة / الوظيفة':'Bearing party / role','عدد حالات التعويض':'Compensation cases',
+'السبب':'Reason','العميل':'Customer','أعلى الفروع في عدد الشكاوى':'Top branches by number of complaints','أعلى العملاء تقديمًا للشكاوى':'Top customers by complaints submitted',
+'الالتزام بالمهلة = الحالات المنجزة خلال المهلة ÷ الحالات ذات التاريخين الصالحين. الأهداف هي القيم المعتمدة حاليًا في لوحة المتابعة.':'Deadline compliance = cases completed within the deadline ÷ cases with both valid dates. Targets are the values currently approved in the tracking dashboard.',
+'الأهداف هي القيم المعتمدة حاليًا في لوحة المتابعة.':'Targets are the values currently approved in the tracking dashboard.',
+'لا توجد بيانات كافية':'Not enough data',
+/* compare deck */
+'تقرير مقارنة':'Comparison report','مقارنة أهم المؤشرات':'Key indicators comparison','المؤشر':'Indicator','المفتوحة':'Open','المقبولة (من المحسومة)':'Accepted (of decided)','المرفوضة (من المحسومة)':'Rejected (of decided)',
+'شحنات تم التعويض عنها':'Compensated shipments','الفرق (الثانية − الأولى)':'Difference (second − first)','الفرق (الثالثة − الأولى)':'Difference (third − first)',
+'النسبة بين القوسين من إجمالي المجموعة نفسها: المقبولة والمرفوضة من الحالات المحسومة، والمفتوحة والمعوَّض عنها من إجمالي الشكاوى.':'The percentage in brackets is of the same group’s total: accepted and rejected out of decided cases; open and compensated out of total complaints.',
+'الأهداف مقابل الفعلي لكل مجموعة':'Targets vs. actual per group',
+'مقارنة الجهة المتحملة للتعويض':'Comparison of the compensation bearing party','مقارنة أسباب الشكاوى':'Comparison of complaint reasons','مقارنة الفروع':'Branch comparison','مقارنة العملاء':'Customer comparison',
+'الجهة المتحملة':'Bearing party','الفرع':'Branch','الكل':'All',
+'تشمل الحالات ذات مبلغ التعويض المسجّل فقط. النسبة من إجمالي حالات التعويض في المجموعة نفسها.':'Includes only cases with a recorded compensation amount. Percentages are of the total compensation cases in the same group.',
+'النسبة من إجمالي شكاوى المجموعة نفسها.':'Percentages are of the same group’s total complaints.'
+});
+N('{0} ج','{0} EGP');
+P('شهر {0}','Month of {0}');
+N('من {0} إلى {1}','From {0} to {1}');
+P('تحليل الأداء وإحصائيات الشكاوى والتعويضات — {0}','Performance analysis and complaint & compensation statistics — {0}');
+P('مقدم إلى: الإدارة التنفيذية – ARRIVE   |   مقدم من: {0}','Presented to: Executive Management – ARRIVE   |   Prepared by: {0}');
+P('عدد السجلات: {0}   |   عوامل التصفية: {1}   |   آخر تحديث للبيانات: {2}','Records: {0}   |   Filters: {1}   |   Last data update: {2}');
+P('عوامل التصفية العامة: {0}   |   آخر تحديث للبيانات: {1}','Global filters: {0}   |   Last data update: {1}');
+P('الملخص التنفيذي — {0}','Executive summary — {0}');
+P('تقرير متابعة الشكاوى والتعويضات – {0}','Complaints & Compensation Tracking Report – {0}');
+P('تقرير مقارنة الشكاوى والتعويضات — {0}','Complaints & Compensation Comparison Report — {0}');
+P('ARRIVE | إدارة المراجعة التشغيلية | {0}','ARRIVE  |  Operational Audit Department  |  {0}');
+P('ARRIVE  |  إدارة المراجعة التشغيلية  |  {0}','ARRIVE  |  Operational Audit Department  |  {0}');
+P('قُبل التعويض في {0} من أصل {1} محسومة ({2}%)، بإجمالي تعويضات {3} ج.م، ورُفض في {4}، وبقيت {5} مفتوحة.','Compensation was accepted in {0} out of {1} decided ({2}%), with total compensation of EGP {3}; it was rejected in {4}, and {5} remain open.');
+P('قُبل التعويض في {0} من أصل {1} محسومة ({2}%)، بإجمالي تعويضات {3} ج.م، ورُفض في {4}.','Compensation was accepted in {0} out of {1} decided ({2}%), with total compensation of EGP {3}; it was rejected in {4}.');
+P('إجمالي الشكاوى {0}، ولا توجد حالات محسومة (قبول أو رفض) ضمن النطاق الحالي.','Total complaints: {0}; there are no decided cases (accepted or rejected) within the current scope.');
+P('تطور الشكاوى والتعويضات شهريًا — {0} ومقارنته بالشهرين السابقين','Monthly trend — {0} vs. the two previous months');
+P('زيادة {0}%','Up {0}%'); P('انخفاض {0}%','Down {0}%');
+P('{0} نقطة مئوية','{0} percentage points');
+P('أعلى شهر في عدد الشكاوى هو {0} ({1})، وأعلى شهر في قيمة التعويضات هو {2} ({3} ج.م).','The month with the most complaints is {0} ({1}), and the month with the highest compensation value is {2} (EGP {3}).');
+P('الشهر حسب تاريخ إضافة الشكوى؛ الشهر المختار والشهران السابقان له بغض النظر عن فلتر الشهر والتاريخ، مع بقية الفلاتر. لا توجد سجلات في: {0} ضمن الفلاتر الحالية.','Month is by complaint added date; the selected month and the two preceding months are shown regardless of the month and date filters, with all other filters applied. No records in: {0} within the current filters.');
+P('الشهر حسب تاريخ إضافة الشكوى بغض النظر عن فلتر الشهر والتاريخ، مع بقية الفلاتر. لا توجد سجلات في: {0} ضمن الفلاتر الحالية.','Month is by complaint added date, regardless of the month and date filters, with all other filters applied. No records in: {0} within the current filters.');
+P('مقارنة {0} مع الشهر السابق {1}','{0} compared with the previous month {1}');
+P('عدد الشكاوى في {0}، مقابل {1} في {2}','Complaints in {0}, vs. {1} in {2}');
+P('إجمالي التعويضات (ج.م) في {0}، مقابل {1} في {2}','Total compensation (EGP) in {0}, vs. {1} in {2}');
+P('نسبة قبول التعويض في {0}، مقابل {1} في {2}','Compensation acceptance rate in {0}, vs. {1} in {2}');
+P('تغيّر عدد الشكاوى ({0}) وتغيّرت مبالغ التعويضات ({1}) مقارنة بالشهر السابق.','The number of complaints changed ({0}) and compensation amounts changed ({1}) compared with the previous month.');
+P('{0} ج.م','EGP {0}');
+P('{0} و{1} يتحملان {2} من التعويضات بإجمالي {3} ج.م.','{0} and {1} bear {2} of compensation, totaling EGP {3}.');
+P('{0} تتحمل {1} من التعويضات.','{0} bears {1} of compensation.');
+P('الجدول يشمل الحالات ذات مبلغ تعويض مسجّل فقط ({0} من إجمالي {1}). الجهة من عمود «وظيفة المتحمل للتعويض».','The table includes only cases with a recorded compensation amount ({0} of a total of {1}). The party is taken from the “Compensation bearer role” column.');
+P('النسبة من إجمالي {0} مسجلة ضمن الفترة والفلاتر المعروضة.','Percentages are of the total {0} recorded within the period and filters shown.');
+P('الالتزام بمهلة التحقيق ({0})','Investigation deadline compliance ({0})');
+P('الالتزام بمهلة تنفيذ التعويض ({0})','Compensation execution deadline compliance ({0})');
+P('{0}% ({1} من {2})','{0}% ({1} of {2})');
+P('{0}% {1} — {2}','{0}% {1} — {2}');
+P('جهات أخرى ({0})','Other parties ({0})');
+P('تعويضات {0} ج.م','Compensation EGP {0}');
+P('نسبة القبول {0} · نسبة المفتوحة {1}','Acceptance rate {0} · Open rate {1}');
+P('{0} ({1})','{0} ({1})');
+})();
+
+/* دليل السياسات: واجهة الأداة فقط (نص السياسات نفسه يبقى كما ورد في شيت السياسات) */
+(function(){
+const P = I18N.pat, A = I18N.add;
+A({
+'المتسبب (مندوب / فرع / قسم)':'Party at fault (courier / branch / department)','المتسبب في التلف أثناء النقل':'Party that caused the damage in transit','المتسبب في التلف':'Party that caused the damage',
+'العميل (الراسل)':'The customer (sender)','المتسبب في عدم تنفيذ البيك أب':'Party that caused the pickup not to be carried out','يتوقف على الإبلاغ المسبق للعميل':'Depends on whether the customer was notified in advance',
+'المتسبب في الوزن الخطأ':'Party that caused the wrong weight','الشركة':'The company','المتسبب في احتساب السعر':'Party that caused the price miscalculation','قسم الداتا إنتري':'Data Entry department',
+'المتسبب داخل الشركة':'Party at fault within the company','الجهة التي فتحت الشحنة':'The party that opened the shipment','المندوب':'The courier','المندوب المسؤول عن التجزئة':'The courier responsible for splitting the shipment',
+'المندوب (أو قسم الفليت سبورت إن لم يُبلّغ العميل)':'The courier (or the Fleet Support department if the customer was not notified)','الفرع إن كان الإهمال منه':'The branch, if the negligence was theirs',
+'موظف خدمة العملاء':'Customer service employee','المتسبب بعد التحقيق (وإلا القسم المحدد)':'The party at fault after investigation (otherwise the designated department)',
+'المندوب (توثيق الشحنة) أو الراسل إن كان الخطأ من تجهيزه':'The courier (shipment documentation) or the sender if the error was in the shipment preparation',
+'التعويض مستحق':'Compensation due','التعويض غير مستحق':'Compensation not due','شروط التعويض غير متحققة':'Compensation conditions not met','تعويض معنوي / إجرائي فقط':'Moral / procedural compensation only',
+'تحتاج مراجعة بشرية':'Needs human review','تصعيد للإدارة المختصة':'Escalate to the competent management','التحقيق غير مكتمل':'Investigation incomplete',
+'السياسات':'Policies','السياسات للعميل':'Customer policies','العقوبات على المخطئ':'Penalties for the party at fault','إجراءات التحقيقات':'Investigation procedures',
+'الإجابات لا تطابق حالة منصوصًا عليها في السياسة.':'The answers do not match any case stated in the policy.','لا تعويض يُحمَّل على أحد وفق هذه السياسة':'No compensation is charged to anyone under this policy',
+'تحدده الإدارة المختصة':'To be determined by the competent management','لم يتحدد بعد':'Not yet determined','لا مقارنة (القرار غير محسوم)':'No comparison (decision not final)',
+'متوافق مع السياسة':'Consistent with the policy','مخالف لقرار السياسة — يُراجع':'Differs from the policy decision — review','المسجل في الشيت:':'Recorded in the sheet:','مقارنة بقرار السياسة:':'Compared with the policy decision:',
+'اختر السياسة المناسبة لبدء الأسئلة.':'Select the appropriate policy to start the questions.','خانة «يستحق تعويض» في شيت السياسات:':'The “Compensation due” cell in the policies sheet:','· القسم:':'· Department:',
+'نعم':'Yes','لا':'No','لم يُحسم':'Undecided','ملاحظة':'Note','السبب':'Reason','أساس التعويض':'Basis of compensation','الطرف المحتمل تحميله':'Party likely to bear it',
+'(خلاصة مني من نص السياسة)':'(summary derived from the policy text)','نص «العقوبات» بالشيت':'“Penalties” text in the sheet','مصدر الحكم':'Source of ruling','غير مذكور':'Not stated',
+'نص السياسة كما في الشيت':'Policy text as in the sheet','السياسة للعميل':'Customer policy','إجراءات التحقيق':'Investigation procedures','استنتاج من النص':'inferred from the text',
+'أداة استرشادية مبنية على نص السياسات (نسخة 22-10-2026) وليست قرارًا رسميًا. الأسئلة والقواعد قراءة تحتاج اعتماد إدارة المراجعة.':'An advisory tool based on the policy text (version 22-10-2026); it is not an official decision. The questions and rules are an interpretation that requires approval from the Audit Department.',
+'— اختر السياسة —':'— Select a policy —','الشكوى:':'Complaint:','التصنيف المسجل:':'Recorded classification:','نتيجة التحقيق المسجلة:':'Recorded investigation result:',
+'السياسة المقترحة تلقائيًا من التصنيف (ربط مقترح غير معتمد، غيّره من القائمة لو غلط).':'Policy suggested automatically from the classification (a proposed, unapproved mapping — change it from the list if wrong).',
+'لا يوجد ربط مقترح لهذا التصنيف: اختر السياسة يدويًا.':'No suggested mapping for this classification: select the policy manually.',
+'السياسات':'Policies'
+});
+P('لم يُحسم: «{0}». استكمل التحقيق ثم أعد الإجابة.','Not settled: “{0}”. Complete the investigation, then answer again.');
+P('فحص الشكوى حسب السياسة — {0}','Check complaint against policy — {0}');
+P('من «{0}»: {1}','From “{0}”: {1}');
+P('الحالة «{0}» · يتحمل التعويض «{1}» · الشخص/الجهة المنسوب لها الخطأ «{2}»','Status “{0}” · compensation borne by “{1}” · person/party blamed “{2}”');
+I18N.frag({'من «':'From “'});
+})();
+
+</script>
+<style id="i18nStyle">
+/* ---- filter collapse arrow ---- */
+.filter-toggle{appearance:none;background:transparent;border:0;cursor:pointer;font-family:inherit;padding:4px 8px;margin-inline-start:-8px;border-radius:8px;transition:background-color .15s ease}
+.filter-toggle:hover{background:var(--arrive-light-blue,#E6F4FF)}
+.filter-toggle:focus-visible{outline:2px solid var(--arrive-blue,#0837C9);outline-offset:2px}
+.filter-toggle .filter-caret{font-size:12px;width:22px;height:22px;display:inline-flex;align-items:center;justify-content:center;border-radius:50%;background:var(--arrive-blue,#0837C9);color:#fff!important;transition:transform .15s ease}
+.filter-body[hidden]{display:none}
+.filter-bar.filters-collapsed{padding-bottom:var(--space-2,8px)}
+.filter-bar.filters-collapsed .filter-head{margin-bottom:0}
+.filter-bar.filters-collapsed #btnMoreFilters{display:none}
+/* ---- LTR (English) ---- */
+html.lang-en body{font-family:'Inter','Cairo',system-ui,sans-serif}
+html.lang-en{--font-ui:'Inter','Cairo',system-ui,sans-serif}
+html.lang-en .report-overlay{direction:ltr}
+html.lang-en .rp-table th{text-align:left}
+html.lang-en .rp-table th.num,html.lang-en .rp-table td.num{text-align:right}
+html.lang-en thead th{text-align:left}
+html.lang-en .drilldown-table thead th{text-align:left}
+html.lang-en .stub-value,html.lang-en .top-meta .meta-item .v,html.lang-en .snap-stat .sv{text-align:left}
+html.lang-en .pg-btn i,html.lang-en .exec-stat-cta i{transform:scaleX(-1)}
+
+</style>
 <!-- ARRIVE Design System: tokens (single colour source) -> UI components -> report pages -->
 <style>
 /* =====================================================================
@@ -1588,6 +2500,7 @@ body.report-open{overflow:hidden}
       <button class="icon-btn" id="headerCompareToggle" type="button" title="وضع المقارنة"><i class="fa-solid fa-right-left"></i> <span id="headerCompareLabel">وضع المقارنة</span></button>
       <button class="icon-btn" id="headerExport" type="button" title="تصدير البيانات"><i class="fa-solid fa-download"></i> تصدير</button>
       <button class="icon-btn" id="headerSettings" style="display:none" type="button" title="الإعدادات"><i class="fa-solid fa-gear"></i> إعدادات</button>
+      <button class="icon-btn" id="langToggle" type="button" data-i18n="skip" title="Switch to English"><i class="fa-solid fa-language"></i> <span class="lt-label">English</span></button>
       <button class="icon-btn" id="themeToggle" type="button"><i class="fa-solid fa-moon" id="themeToggleIcon"></i> <span id="themeToggleLabel">الوضع الداكن</span></button>
     </div>
   </div>
@@ -1631,13 +2544,14 @@ body.report-open{overflow:hidden}
 <div class="filter-bar" id="filterBar">
 <div class="filter-wrap">
   <div class="filter-head">
-    <div class="filter-title"><i class="fa-solid fa-sliders"></i> عوامل التصفية</div>
+    <button type="button" class="filter-title filter-toggle" id="btnFilterToggle" aria-expanded="true" aria-controls="filterBody" title="إخفاء الفلاتر"><i class="fa-solid fa-chevron-up filter-caret" id="filterToggleCaret"></i><i class="fa-solid fa-sliders"></i> <span>عوامل التصفية</span></button>
     <div class="filter-head-actions">
       <span class="result-count"><b id="resultCount">0</b> نتيجة</span>
       <button class="qa-btn" id="btnMoreFilters" type="button" aria-expanded="true" aria-controls="filterMore"><i class="fa-solid fa-chevron-up" id="moreFiltersCaret"></i> كل الفلاتر / إخفاء الإضافية <span class="more-count hidden" id="moreFiltersCount">0</span></button>
       <button class="btn-reset" id="btnReset" type="button"><i class="fa-solid fa-rotate-left"></i> مسح الفلاتر</button>
     </div>
   </div>
+  <div id="filterBody" class="filter-body">
   <div class="filter-grid" id="filterPrimary">
 <div class="fgroup filter-search">
   <label for="fSearch">بحث (اسم، بوليصة، محتوى)</label>
@@ -1708,6 +2622,7 @@ body.report-open{overflow:hidden}
 <div class="fgroup">
     <label for="fReviewTo">تاريخ المراجعة إلى</label>
     <input type="date" id="fReviewTo">
+  </div>
   </div>
   </div>
 </div>
@@ -3130,7 +4045,7 @@ const ALL_FILTER_IDS = [...MULTI_SELECT_IDS, 'fDateFrom','fDateTo','fReviewFrom'
 
 // ---------- Populate filter dropdowns ----------
 function uniqueSorted(key){
-  return [...new Set(DATA.map(d => d[key]).filter(Boolean))].sort((a,b)=>a.localeCompare(b,'ar'));
+  return [...new Set(DATA.map(d => d[key]).filter(Boolean))].sort((a,b)=>a.localeCompare(b,I18N.isEn()?'en':'ar'));
 }
 // Rebuilds a multi-select's option list from a values array, preserving any
 // previously-selected values that still exist in the new list.
@@ -3272,6 +4187,22 @@ const barValueLabels = {
   }
 };
 
+const i18nChartPlugin = {
+  id:'i18n',
+  beforeUpdate(chart){
+    const en = I18N.isEn(), d = chart.data;
+    if(d.labels){
+      if(d.labels !== chart.$trRef){ chart.$arLabels = d.labels.slice(); chart.$trRef = null; }
+      if(en){ const out = chart.$arLabels.map(l=>I18N.t(l,true)); d.labels = out; chart.$trRef = out; }
+      else if(chart.$trRef){ d.labels = chart.$arLabels; chart.$trRef = null; }
+    }
+    (d.datasets||[]).forEach(ds=>{ if(ds.__ar===undefined) ds.__ar = ds.label; if(ds.__ar!==undefined) ds.label = en ? I18N.t(ds.__ar) : ds.__ar; });
+    const sc = chart.options.scales || {};
+    Object.keys(sc).forEach(k=>{ const ti = sc[k].title; if(ti && ti.text!==undefined){ if(ti.__ar===undefined) ti.__ar = ti.text; ti.text = en ? I18N.t(ti.__ar) : ti.__ar; } });
+    const lg = chart.options.plugins && chart.options.plugins.legend; if(lg && lg.rtl!==undefined){ lg.rtl = !en; lg.textDirection = en ? 'ltr' : 'rtl'; }
+  }
+};
+Chart.register(i18nChartPlugin);
 function makeCharts(){
   chartBranch = new Chart(document.getElementById('chartBranch'), {
     type:'bar',
@@ -3799,10 +4730,10 @@ document.querySelectorAll('#dataTable thead th[data-key]').forEach(th=>{
 
 // ---------- Modal ----------
 function field(label, value){
-  return `<div class="field"><div class="l">${label}</div><div class="v">${value ?? '—'}</div></div>`;
+  return `<div class="field"><div class="l">${label}</div><div class="v" data-i18n="exact">${value ?? '—'}</div></div>`;
 }
 function fieldFull(label, value){
-  return `<div class="field full"><div class="l">${label}</div><div class="v">${value ?? '—'}</div></div>`;
+  return `<div class="field full"><div class="l">${label}</div><div class="v" data-i18n="exact">${value ?? '—'}</div></div>`;
 }
 function openModal(d){
   const modal = document.getElementById('modal');
@@ -3825,7 +4756,7 @@ function openModal(d){
       ${fieldFull('محتوى الشكوى', d.content)}
       ${field('نتيجة التحقيق', d.investigation_result)}
       ${field('الحالة', statusBadge(d.status))}
-      ${field('مبلغ التعويض', isCompensationCountable(d) ? d.compensation_amount.toLocaleString('en-US')+' ج.م' : '—')}
+      ${field('مبلغ التعويض', isCompensationCountable(d) ? d.compensation_amount.toLocaleString('en-US')+' '+I18N.L('ج.م','EGP') : '—')}
       ${field('يتحمل التعويض', d.compensation_bearer)}
       ${field('شهر التعويض', d.compensation_month)}
       ${field('SLA تنفيذ التعويض (يوم)', typeof d.sla_compensation_days==='number' ? d.sla_compensation_days : '—')}
@@ -5068,14 +5999,14 @@ function countActiveFilters(){
   return n;
 }
 function updateLiveStats(rows){
-  document.getElementById('lsRefresh').textContent = new Date().toLocaleTimeString('ar-EG-u-nu-latn', {hour:'2-digit', minute:'2-digit', second:'2-digit'});
+  document.getElementById('lsRefresh').textContent = new Date().toLocaleTimeString(I18N.isEn()?'en-GB':'ar-EG-u-nu-latn', {hour:'2-digit', minute:'2-digit', second:'2-digit'});
   document.getElementById('lsTotal').textContent = DATA.length.toLocaleString('en-US');
   document.getElementById('lsFilters').textContent = countActiveFilters();
   document.getElementById('lsVisible').textContent = rows.length.toLocaleString('en-US');
 }
 function tickClock(){
   const el = document.getElementById('lsClock');
-  if(el) el.textContent = new Date().toLocaleTimeString('ar-EG-u-nu-latn', {hour:'2-digit', minute:'2-digit', second:'2-digit'});
+  if(el) el.textContent = new Date().toLocaleTimeString(I18N.isEn()?'en-GB':'ar-EG-u-nu-latn', {hour:'2-digit', minute:'2-digit', second:'2-digit'});
 }
 setInterval(tickClock, 1000);
 tickClock();
@@ -5160,18 +6091,18 @@ document.querySelectorAll('.panel h3').forEach(h=>{
 
 // ---------- 8) Drill-down navigation on charts ----------
 function drillSet(id, value){ const el = document.getElementById(id); if(el){ el.value = value; syncMultiSelectUI(id); render(); } }
-chartBranch.options.onClick = (evt, els)=>{ if(els.length){ drillSet('fBranch', chartBranch.data.labels[els[0].index]); } };
-chartBearer.options.onClick = (evt, els)=>{ if(els.length){ drillSet('fBearer', chartBearer.data.labels[els[0].index]); } };
+chartBranch.options.onClick = (evt, els)=>{ if(els.length){ drillSet('fBranch', (chartBranch.$arLabels||chartBranch.data.labels)[els[0].index]); } };
+chartBearer.options.onClick = (evt, els)=>{ if(els.length){ drillSet('fBearer', (chartBearer.$arLabels||chartBearer.data.labels)[els[0].index]); } };
 chartType.options.onClick = (evt, els)=>{
   if(!els.length) return;
   // Use the raw (unstripped) type value so it matches an actual fType option.
   const idx = els[0].index;
-  const rawValue = (chartType.rawLabels && chartType.rawLabels[idx]) || chartType.data.labels[idx];
+  const rawValue = (chartType.rawLabels && chartType.rawLabels[idx]) || (chartType.$arLabels||chartType.data.labels)[idx];
   drillSet('fType', rawValue);
 };
 chartClassification.options.onClick = (evt, els)=>{
   if(!els.length) return;
-  drillSet('fClassification', chartClassification.data.labels[els[0].index]);
+  drillSet('fClassification', (chartClassification.$arLabels||chartClassification.data.labels)[els[0].index]);
 };
 [chartBranch, chartBearer, chartType, chartClassification].forEach(c=>{
   c.canvas.style.cursor = 'pointer';
@@ -5300,7 +6231,7 @@ function getCacheTimeLabel(){
   try{
     const t = localStorage.getItem(CACHE_TIME_STORAGE_KEY);
     if(!t) return '';
-    return new Date(parseInt(t,10)).toLocaleString('ar-EG-u-nu-latn');
+    return new Date(parseInt(t,10)).toLocaleString(I18N.isEn()?'en-GB':'ar-EG-u-nu-latn');
   }catch(e){ return ''; }
 }
 
@@ -6179,6 +7110,7 @@ document.getElementById('btnReset').addEventListener('click', ()=>{ if(compareMo
   el.textContent = new Date().toLocaleDateString('en-CA');
 })();
 
+const MORE_FILTER_IDS = ['fClassification','fCompMonth','fSender','fBearer','fReviewResult','fConfirm','fReviewFrom','fReviewTo'];
 // ---------- Boot + auto-refresh (data only — the page itself is never reloaded, never blocked) ----------
 loadApiUrlFromStorage();
 loadAutoRefreshFromStorage();
@@ -6186,7 +7118,6 @@ loadDashboardData({ isRefresh: false });
 setupAutoRefresh();
 
 // ---------- ARRIVE UI helpers (presentation only — no business logic) ----------
-const MORE_FILTER_IDS = ['fClassification','fCompMonth','fSender','fBearer','fReviewResult','fConfirm','fReviewFrom','fReviewTo'];
 function arriveAfterRender(rows){
   const ds = rows.map(d=>d.date_added).filter(Boolean).sort();
   const sub = document.getElementById('kpiPeriodSub');
@@ -6209,6 +7140,26 @@ function arriveAfterRender(rows){
     caret.className = 'fa-solid ' + (willOpen ? 'fa-chevron-up' : 'fa-chevron-down');
   });
 })();
+// ---------- Filters panel: collapse / expand with an arrow (state remembered on this device) ----------
+(function(){
+  const btn = document.getElementById('btnFilterToggle'), body = document.getElementById('filterBody'), bar = document.getElementById('filterBar'), caret = document.getElementById('filterToggleCaret');
+  if(!btn || !body) return;
+  const KEY = 'arrive_filters_collapsed';
+  function set(collapsed){
+    body.hidden = collapsed;
+    bar.classList.toggle('filters-collapsed', collapsed);
+    btn.setAttribute('aria-expanded', String(!collapsed));
+    caret.className = 'fa-solid filter-caret ' + (collapsed ? 'fa-chevron-down' : 'fa-chevron-up');
+    btn.title = (window.I18N && I18N.isEn()) ? (collapsed ? 'Show filters' : 'Hide filters') : (collapsed ? 'إظهار الفلاتر' : 'إخفاء الفلاتر');
+    try{ localStorage.setItem(KEY, collapsed ? '1' : '0'); }catch(e){}
+  }
+  btn.addEventListener('click', ()=> set(!body.hidden));
+  let saved = '0'; try{ saved = localStorage.getItem(KEY) || '0'; }catch(e){}
+  set(saved === '1');
+  if(window.I18N) I18N.onChange(()=> set(body.hidden));
+})();
+
+window.__i18nRefresh = function(){ try{ render(); if(typeof compareModeActive!=='undefined' && compareModeActive) renderComparePanels(); const m=document.getElementById('headerCompareLabel'); }catch(e){ console.error(e); } };
 document.getElementById('headerReport')?.addEventListener('click', ()=>{ if(window.ArriveReport) window.ArriveReport.open(); });
 </script>
 <script>
@@ -7099,17 +8050,21 @@ window.ArrivePolicy={open:openPolicy,POL,MAP,evalWith:(id,a)=>{cur=POL.find(p=>p
   const pc = (a,t) => t ? N1(a/t*100)+'%' : '—';
   // العدد والمعدود في العربية: 1 مفرد، 2 مثنى، 3–10 جمع، 11 فأكثر مفرد منصوب
   const ar3 = (n, one, two, few, many) => { const v = Math.abs(Math.round(n)); return v===1 ? one : v===2 ? two : (v>=3 && v<=10) ? `${N(v)} ${few}` : `${N(v)} ${many}`; };
-  const cntShk = n => ar3(n,'شكوى واحدة','شكوتان','شكاوى','شكوى');
-  const cntCase = n => ar3(n,'حالة واحدة','حالتان','حالات','حالة');
-  const daysTxt = n => ar3(n,'يوم واحد','يومان','أيام','يومًا');
+  const EN = () => I18N.isEn();
+  const en3 = (n, one, many) => { const v = Math.abs(Math.round(n)); return `${N(v)} ${v===1 ? one : many}`; };
+  const cntShk = n => EN() ? en3(n,'complaint','complaints') : ar3(n,'شكوى واحدة','شكوتان','شكاوى','شكوى');
+  const cntCase = n => EN() ? en3(n,'case','cases') : ar3(n,'حالة واحدة','حالتان','حالات','حالة');
+  const daysTxt = n => EN() ? en3(n,'day','days') : ar3(n,'يوم واحد','يومان','أيام','يومًا');
+  const EN_MONTHS = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+  const MONTHS = () => EN() ? EN_MONTHS : ARABIC_MONTHS;
   const sgn = d => d>0?'+':d<0?'−':'';
   const lbl = v => { const s = (v==null?'':String(v)).trim(); return !s ? 'غير محدد' : (s.toLowerCase()==='not mentioned' ? 'غير مذكور بالمصدر' : s); };
   const UNK = ['غير محدد','غير مذكور بالمصدر'];
   const isOpenRow = d => !!(d.status && (d.status.includes('جارى') || d.status.includes('التحقيق')));
   const groupBy = (arr, keyFn) => { const mp = new Map(); arr.forEach(d=>{ const k = keyFn(d); if(!mp.has(k)) mp.set(k, []); mp.get(k).push(d); }); return mp; };
   const ym = v => (v && /^\d{4}-\d{2}/.test(String(v))) ? String(v).slice(0,7) : null;
-  const monthName = k => { const [y,m] = k.split('-'); return `${ARABIC_MONTHS[parseInt(m,10)-1]||m} ${y}`; };
-  const monthShort = k => ARABIC_MONTHS[parseInt(k.split('-')[1],10)-1] || k;
+  const monthName = k => { const [y,m] = k.split('-'); return `${MONTHS()[parseInt(m,10)-1]||m} ${y}`; };
+  const monthShort = k => MONTHS()[parseInt(k.split('-')[1],10)-1] || k;
   const chipsText = () => [...document.querySelectorAll('#activeFiltersBar .active-filter-chip')].map(c=>c.textContent.replace(/\s+/g,' ').replace(/[✕×]/g,'').trim()).filter(Boolean);
 
   /* ---------- حساب مجموعة سجلات (نفس دوال اللوحة) ---------- */
@@ -7137,8 +8092,31 @@ window.ArrivePolicy={open:openPolicy,POL,MAP,evalWith:(id,a)=>{cur=POL.find(p=>p
 
   /* ---------- أدوات الرسم ---------- */
   let pptx, ctxLabel;
-  function base(title){
+  /* English deck: strings go through the dictionary, text is left-aligned, and body elements are mirrored so the slide reads left-to-right */
+  const SLIDE_W = 13.333;
+  const DECK_EN = { 'عدد الشكاوى':'Complaints', 'مبلغ التعويضات (ج.م) — النسبة من إجمالي الأشهر الثلاثة':'Compensation (EGP) — % of 3-month total', 'مبالغ التعويضات (ج.م) — النسبة من إجمالي الشهرين':'Compensation (EGP) — % of 2-month total' };
+  function addSl(){
     const s = pptx.addSlide();
+    if(!EN()) return s;
+    const T = v => typeof v === 'string' ? (DECK_EN[v] || I18N.t(v)) : v;
+    const seen = v => { if(typeof v === 'string' && /[\u0600-\u06FF]/.test(v)){ (window.__deckResidual || (window.__deckResidual = [])).push(v); } return v; };
+    const adj = (o, mirror) => {
+      o = Object.assign({}, o || {});
+      if('rtlMode' in o) o.rtlMode = false;
+      if(o.align === 'right') o.align = 'left';
+      if(mirror !== false && typeof o.x === 'number' && typeof o.w === 'number' && (o.y == null || o.y >= 1.4)) o.x = Math.round((SLIDE_W - o.x - o.w) * 1000) / 1000;
+      return o;
+    };
+    const aT = s.addText.bind(s), aTb = s.addTable.bind(s), aC = s.addChart.bind(s), aS = s.addShape.bind(s), aI = s.addImage.bind(s);
+    s.addText = (t, o) => aT(Array.isArray(t) ? t.map(r => Object.assign({}, r, { text: seen(T(r.text)) })) : seen(T(t)), adj(o));
+    s.addShape = (sh, o) => aS(sh, adj(o));
+    s.addImage = o => aI(adj(o));
+    s.addTable = (rows, o) => aTb(rows.map(r => r.map(c => { c = Object.assign({}, c); c.text = seen(T(c.text)); c.options = adj(c.options, false); return c; })), adj(o));
+    s.addChart = (type, data, o) => aC(type, data.map(d => Object.assign({}, d, { name: seen(T(d.name)), labels: d.labels.map(l => I18N.t(l, true)) })), adj(o));
+    return s;
+  }
+  function base(title){
+    const s = addSl();
     s.background = { color:C.white };
     s.addShape(pptx.ShapeType.rect, { x:0, y:0, w:13.333, h:0.08, fill:{color:C.teal}, line:{color:C.teal} });
     s.addImage({ data:LOGO, x:0.5, y:0.28, w:1.4, h:0.41 });
@@ -7163,8 +8141,8 @@ window.ArrivePolicy={open:openPolicy,POL,MAP,evalWith:(id,a)=>{cur=POL.find(p=>p
     const n = header.length;
     const cell = (t, isH, i, last) => ({ text:String(t), options:{ fontFace:FONT, fontSize:o.fs||12, bold:isH||last, color:isH?C.white:C.ink, fill:{color:isH?C.navy:(last?C.light:C.white)}, align:i===0?'right':'center', valign:'middle', border:[{type:'solid',pt:0.5,color:C.line},{type:'solid',pt:0.5,color:C.line},{type:'solid',pt:0.5,color:C.line},{type:'solid',pt:0.5,color:C.line}], rtlMode:true } });
     const rows = [header.map((t,i)=>cell(t,true,i)) ].concat(body.map((r,ri)=>r.map((t,i)=>cell(t,false,i,o.totalRow && ri===body.length-1))));
-    const rev = rows.map(r=>r.slice().reverse());   // الاتجاه من اليمين لليسار
-    const widths = (o.colW || header.map(()=> o.w/n)).slice().reverse();
+    const rev = EN() ? rows : rows.map(r=>r.slice().reverse());   // الاتجاه من اليمين لليسار
+    const widths = EN() ? (o.colW || header.map(()=> o.w/n)).slice() : (o.colW || header.map(()=> o.w/n)).slice().reverse();
     s.addTable(rev, { x:o.x, y:o.y, w:o.w, colW:widths, rowH:o.rowH||0.34 });
   }
   function barChart(s, labels, series, o){
@@ -7185,7 +8163,7 @@ window.ArrivePolicy={open:openPolicy,POL,MAP,evalWith:(id,a)=>{cur=POL.find(p=>p
     const refresh = (document.getElementById('headerLastUpdate')||{}).textContent || 'غير محدد بالمصدر';
 
     // 1) الغلاف
-    let s = pptx.addSlide(); s.background = { color:C.white };
+    let s = addSl(); s.background = { color:C.white };
     s.addShape(pptx.ShapeType.rect, { x:0, y:0, w:13.333, h:0.08, fill:{color:C.teal}, line:{color:C.teal} });
     s.addImage({ data:LOGO, x:4.85, y:1.3, w:3.63, h:1.06 });
     s.addText('تقرير متابعة الشكاوى والتعويضات', { x:1.17, y:2.9, w:11, h:0.85, fontFace:FONT, fontSize:34, bold:true, color:C.navy, align:'center', rtlMode:true });
@@ -7299,9 +8277,10 @@ window.ArrivePolicy={open:openPolicy,POL,MAP,evalWith:(id,a)=>{cur=POL.find(p=>p
       note(s2, `النسبة من إجمالي ${cntShk(S.n)} مسجلة ضمن الفترة والفلاتر المعروضة.`, 6.05);
     };
     const topOf = (n, one, two, pl) => n===1 ? [`أعلى ${one}`,'يمثل'] : n===2 ? [`أعلى ${two}`,'يمثلان'] : [`أعلى ${N(n)} ${pl}`,'تمثل'];
-    ranked('أكثر أسباب الشكاوى تكرارًا', d=>d.classification, 5, 'السبب', (t,sum)=>{ const [a,v] = topOf(t.length,'سبب','سببين','أسباب'); return `${a} ${v} ${pc(sum,S.n)} من الشكاوى (${N(sum)} من ${N(S.n)})، وأعلى سبب هو «${t[0].k}» بنسبة ${pc(t[0].n,S.n)}.`; }, true);
-    ranked('أعلى الفروع في عدد الشكاوى', d=>d.branch, 6, 'الفرع', (t,sum)=>{ const [a,v] = topOf(t.length,'فرع','فرعين','فروع'); return `${a} ${v} ${pc(sum,S.n)} من الشكاوى، وأعلى فرع هو «${t[0].k}» بعدد ${cntShk(t[0].n)} (${pc(t[0].n,S.n)}).`; }, true);
-    ranked('أعلى العملاء تقديمًا للشكاوى', d=>String(d.complainant||'').trim(), 5, 'العميل', (t,sum)=>`أعلى عميل هو «${t[0].k}» ويمثل ${pc(t[0].n,S.n)} من إجمالي الشكاوى بعدد ${cntShk(t[0].n)}.`, true);
+    const tk = k => EN() ? I18N.t(k,true) : k;
+    ranked('أكثر أسباب الشكاوى تكرارًا', d=>d.classification, 5, 'السبب', (t,sum)=>{ if(EN()) return `The top ${t.length>1?t.length+' reasons account':'reason accounts'} for ${pc(sum,S.n)} of complaints (${N(sum)} of ${N(S.n)}); the most frequent reason is “${tk(t[0].k)}” at ${pc(t[0].n,S.n)}.`; const [a,v] = topOf(t.length,'سبب','سببين','أسباب'); return `${a} ${v} ${pc(sum,S.n)} من الشكاوى (${N(sum)} من ${N(S.n)})، وأعلى سبب هو «${t[0].k}» بنسبة ${pc(t[0].n,S.n)}.`; }, true);
+    ranked('أعلى الفروع في عدد الشكاوى', d=>d.branch, 6, 'الفرع', (t,sum)=>{ if(EN()) return `The top ${t.length>1?t.length+' branches account':'branch accounts'} for ${pc(sum,S.n)} of complaints; the top branch is “${tk(t[0].k)}” with ${cntShk(t[0].n)} (${pc(t[0].n,S.n)}).`; const [a,v] = topOf(t.length,'فرع','فرعين','فروع'); return `${a} ${v} ${pc(sum,S.n)} من الشكاوى، وأعلى فرع هو «${t[0].k}» بعدد ${cntShk(t[0].n)} (${pc(t[0].n,S.n)}).`; }, true);
+    ranked('أعلى العملاء تقديمًا للشكاوى', d=>String(d.complainant||'').trim(), 5, 'العميل', (t,sum)=> EN() ? `The top customer is “${tk(t[0].k)}”, representing ${pc(t[0].n,S.n)} of total complaints with ${cntShk(t[0].n)}.` : `أعلى عميل هو «${t[0].k}» ويمثل ${pc(t[0].n,S.n)} من إجمالي الشكاوى بعدد ${cntShk(t[0].n)}.`, true);
 
     // 9) الأهداف مقابل الفعلي
     s = base('الأهداف مقابل الفعلي');
@@ -7318,7 +8297,7 @@ window.ArrivePolicy={open:openPolicy,POL,MAP,evalWith:(id,a)=>{cur=POL.find(p=>p
   }
 
   function thanks(sub){
-    const s = pptx.addSlide(); s.background = { color:C.white };
+    const s = addSl(); s.background = { color:C.white };
     s.addShape(pptx.ShapeType.rect, { x:0, y:0, w:13.333, h:0.08, fill:{color:C.teal}, line:{color:C.teal} });
     s.addImage({ data:LOGO, x:4.85, y:1.8, w:3.63, h:1.06 });
     s.addText('شكرًا لكم', { x:1.17, y:3.2, w:11, h:0.85, fontFace:FONT, fontSize:34, bold:true, color:C.navy, align:'center', rtlMode:true });
@@ -7338,7 +8317,7 @@ window.ArrivePolicy={open:openPolicy,POL,MAP,evalWith:(id,a)=>{cur=POL.find(p=>p
     const chips = chipsText();
     const refresh = (document.getElementById('headerLastUpdate')||{}).textContent || 'غير محدد بالمصدر';
 
-    let s = pptx.addSlide(); s.background = { color:C.white };
+    let s = addSl(); s.background = { color:C.white };
     s.addShape(pptx.ShapeType.rect, { x:0, y:0, w:13.333, h:0.08, fill:{color:C.teal}, line:{color:C.teal} });
     s.addImage({ data:LOGO, x:4.85, y:1.1, w:3.63, h:1.06 });
     s.addText('تقرير مقارنة الشكاوى والتعويضات', { x:1.17, y:2.6, w:11, h:0.85, fontFace:FONT, fontSize:34, bold:true, color:C.navy, align:'center', rtlMode:true });
@@ -7395,7 +8374,7 @@ window.ArrivePolicy={open:openPolicy,POL,MAP,evalWith:(id,a)=>{cur=POL.find(p=>p
       barChart(s2, keys.map(x=>x.k), SP.map((x,i)=>({name:names[i], values:keys.map(k=>k.g[i].length)})), { x:0.9, y:1.5, w:5.4, h:3.7, dir:'bar', colors:GROUP_COLORS.slice(0,n), fmt:'#,##0;-#,##0;;' });
       table(s2, [head1].concat(names), keys.map(k=>[k.k].concat(k.g.map((r,i)=>`${N(r.length)} (${pc(r.length,tot[i])})`))), { x:6.5, y:1.55, w:5.94, rowH:0.5, fs:10.5, colW:[1.8].concat(SP.map(()=>(5.94-1.8)/n)) });
       const lead = keys[0];
-      insight(s2, `أعلى بند إجمالًا هو «${lead.k}»: ${names.map((nm,i)=>`${nm} ${N(lead.g[i].length)} (${pc(lead.g[i].length,tot[i])})`).join(' · ')}.`, 5.4, 0.7);
+      insight(s2, EN() ? `The top item overall is “${I18N.t(lead.k,true)}”: ${names.map((nm,i)=>`${nm} ${N(lead.g[i].length)} (${pc(lead.g[i].length,tot[i])})`).join(' · ')}.` : `أعلى بند إجمالًا هو «${lead.k}»: ${names.map((nm,i)=>`${nm} ${N(lead.g[i].length)} (${pc(lead.g[i].length,tot[i])})`).join(' · ')}.`, 5.4, 0.7);
       note(s2, useComp ? 'تشمل الحالات ذات مبلغ التعويض المسجّل فقط. النسبة من إجمالي حالات التعويض في المجموعة نفسها.' : 'النسبة من إجمالي شكاوى المجموعة نفسها.', 6.25);
     };
     dim('مقارنة الجهة المتحملة للتعويض', 'الجهة المتحملة', d=>d.compensation_bearer, 6, true);
@@ -7419,22 +8398,26 @@ window.ArrivePolicy={open:openPolicy,POL,MAP,evalWith:(id,a)=>{cur=POL.find(p=>p
     const btn = document.getElementById('headerDeck'); const old = btn ? btn.innerHTML : '';
     if(btn){ btn.disabled = true; btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> جارٍ الإعداد…'; }
     try{
-      if(!(await ensureLib())){ alert('تعذّر تحميل مكتبة إنشاء العروض التقديمية (pptxgen). تأكد من رفع الملف pptxgen.bundle.js مع اللوحة أو من الاتصال بالإنترنت ثم أعد المحاولة.'); return; }
+      if(!(await ensureLib())){ alert(I18N.t('تعذّر تحميل مكتبة إنشاء العروض التقديمية (pptxgen). تأكد من رفع الملف pptxgen.bundle.js مع اللوحة أو من الاتصال بالإنترنت ثم أعد المحاولة.')); return; }
       pptx = new PptxGenJS();
-      pptx.layout = 'LAYOUT_WIDE'; pptx.rtlMode = true;
-      pptx.title = 'تقرير متابعة الشكاوى والتعويضات'; pptx.company = 'ARRIVE'; pptx.author = 'إدارة المراجعة التشغيلية';
+      pptx.layout = 'LAYOUT_WIDE'; pptx.rtlMode = !EN();
+      pptx.title = I18N.t('تقرير متابعة الشكاوى والتعويضات'); pptx.company = 'ARRIVE'; pptx.author = I18N.t('إدارة المراجعة التشغيلية');
       const cmp = (typeof compareModeActive!=='undefined' && compareModeActive && typeof getFilteredForPanel==='function');
-      if(!cmp && !getFiltered().length){ alert('لا توجد بيانات متاحة وفقًا للفلاتر المحددة.'); return; }
+      if(!cmp && !getFiltered().length){ alert(I18N.t('لا توجد بيانات متاحة وفقًا للفلاتر المحددة.')); return; }
       if(cmp) buildCompare(); else buildSingle();
       const stamp = new Date().toISOString().slice(0,10);
       await pptx.writeFile({ fileName:`ARRIVE_Complaints_${cmp?'Comparison':'Report'}_${stamp}.pptx` });
-    }catch(e){ console.error(e); alert('تعذّر إعداد العرض التقديمي. أعد المحاولة بعد تحديث اللوحة.'); }
+    }catch(e){ console.error(e); alert(I18N.t('تعذّر إعداد العرض التقديمي. أعد المحاولة بعد تحديث اللوحة.')); }
     finally{ if(btn){ btn.disabled = false; btn.innerHTML = old; } }
   }
   document.getElementById('headerDeck')?.addEventListener('click', generate);
-  window.ArriveDeck = { generate, ensureLib, _build: ()=>{ pptx = new PptxGenJS(); pptx.layout='LAYOUT_WIDE'; pptx.rtlMode = true; const cmp = (typeof compareModeActive!=='undefined' && compareModeActive); if(cmp) buildCompare(); else buildSingle(); return pptx; } };
+  window.ArriveDeck = { generate, ensureLib, _build: ()=>{ pptx = new PptxGenJS(); pptx.layout='LAYOUT_WIDE'; pptx.rtlMode = !EN(); const cmp = (typeof compareModeActive!=='undefined' && compareModeActive); if(cmp) buildCompare(); else buildSingle(); return pptx; } };
 })();
 </script>
 
+<script id="i18nBoot">
+I18N.onChange(function(){ if(typeof window.__i18nRefresh==="function") window.__i18nRefresh(); });
+I18N.boot();
+</script>
 </body>
 </html>
